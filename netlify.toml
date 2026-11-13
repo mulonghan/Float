@@ -5,6 +5,13 @@
 [[plugins]]
   package = "@netlify/plugin-nextjs"
 
+# 灵眸 API 反代：网页请求 /lmu/* 由 Netlify 转发到 api.lmuai.com，绕开浏览器跨域拦截
+[[redirects]]
+  from = "/lmu/*"
+  to = "https://api.lmuai.com/:splat"
+  status = 200
+  force = true
+
 # 离线推送的执行函数已迁移至 Supabase Edge Functions（supabase/functions/），
 # 原因：Netlify Background Functions 免费档不可用。部署方式见 docs/push-supabase.sql。
 
