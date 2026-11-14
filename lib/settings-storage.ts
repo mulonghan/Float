@@ -65,18 +65,6 @@ function isUnsupportedPresetFormat(obj: Record<string, unknown>): boolean {
 const UNSUPPORTED_WB_ROOT_FIELDS = ["recursiveScan", "caseSensitive", "originalData", "globalSelect"];
 const UNSUPPORTED_WB_ENTRY_FIELDS = ["selectiveLogic", "secondary_keys", "extensions", "characterFilter", "vectorized"];
 
-function isUnsupportedWorldBookFormat(obj: Record<string, unknown>): boolean {
-    // Root-level external fields
-    if (UNSUPPORTED_WB_ROOT_FIELDS.some(f => f in obj)) return true;
-    // Dictionary entries are treated as unsupported import format
-    if (obj.entries && typeof obj.entries === "object" && !Array.isArray(obj.entries)) return true;
-    // Check entry-level external fields
-    const entries = Array.isArray(obj.entries) ? obj.entries : (obj.entries && typeof obj.entries === "object" ? Object.values(obj.entries) : []);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (entries.length > 0 && entries.some((e: any) => e && UNSUPPORTED_WB_ENTRY_FIELDS.some(f => f in e))) return true;
-    return false;
-}
-
 // --- Keys ---
 const API_CONFIGS_KEY = "ai_phone_api_configs_v1";
 const VOICE_CONFIGS_KEY = "ai_phone_voice_configs_v1";
@@ -431,57 +419,88 @@ export function createWorldBook(name: string): WorldBookConfig {
     };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseWorldBookEntry(e: any): WorldBookEntry {
-    // Resolve key: support arrays, strings, and fallback field names
-    let key = "";
-    if (Array.isArray(e.key)) {
-        key = e.key.join(",");
-    } else {
-        key = String(e.key ?? e.keysecondary ?? e.keyword ?? e.keys?.join(",") ?? "");
+function worldBookRecord(raw: unknown): Record<string, unknown> | null {
+    return raw !== null && typeof raw === "object" && !Array.isArray(raw)
+        ? raw as Record<string, unknown>
+        : null;
+}
+
+function worldBookId(value: unknown): string | undefined {
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    if (typeof value === "string" && value.trim()) return value;
+}
+
+function worldBookNumber(value: unknown, fallback: number): number {
+    if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+}
+
+export function parseWorldBookEntry(raw: unknown, options: { fallbackUid?: string; replaceUid?: string } = {}): WorldBookEntry | null {
+    const entry = worldBookRecord(raw);
+    if (!entry) return null;
+    if (UNSUPPORTED_WB_ENTRY_FIELDS.some(field => field in entry)) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
+
+    const keywords = entry.key ?? entry.keywords ?? entry.keys ?? entry.keyword ?? entry.keysecondary;
+    const title = entry.comment ?? entry.name;
+    if ((entry.content !== undefined && typeof entry.content !== "string")
+        || (typeof entry.content !== "string" && typeof title !== "string" && typeof keywords !== "string" && !Array.isArray(keywords))) {
+        return null;
     }
-    // Merge disable/disabled/enabled: entry is disabled if disable=true OR enabled=false
-    const isDisabled = Boolean(e.disable || e.disabled || false) || (e.enabled === false);
+    const key = Array.isArray(keywords)
+        ? keywords.filter((word): word is string => typeof word === "string").join(",")
+        : typeof keywords === "string" ? keywords : "";
+    const position = entry.position;
+    const legacyPosition = position === "before_char" || position === "after_char"
+        || position === "before_an" || position === "after_an"
+        || position === "before_em" || position === "after_em";
+    const role = entry.role === "user" ? 1 : entry.role === "assistant" ? 2 : worldBookNumber(entry.role, 0);
+
     return {
-        uid: e.uid ? String(e.uid) : String(e.id || generateId("wb-entry")),
+        uid: options.replaceUid ?? worldBookId(entry.uid) ?? worldBookId(entry.id) ?? options.fallbackUid ?? generateId("wb-entry"),
         key,
-        content: String(e.content ?? ""),
-        comment: String(e.comment ?? ""),
-        use_regex: Boolean(e.use_regex || e.isRegex || false),
-        disable: isDisabled,
-        constant: Boolean(e.constant || false),
-        position: e.position !== undefined ? (typeof e.position === "string" && /^\d+$/.test(e.position) ? Number(e.position) : e.position) : "before_char",
-        depth: Number(e.depth) || 0,
-        probability: Number(e.probability) || 100,
-        useProbability: Boolean(e.useProbability || false),
-        role: Number(e.role) || 0,
-        insertion_order: Number(e.order ?? e.insertion_order ?? 50),
+        content: typeof entry.content === "string" ? entry.content : "",
+        comment: typeof title === "string" ? title : "",
+        use_regex: (entry.use_regex ?? entry.isRegex) === true,
+        disable: entry.disable === true || entry.disabled === true || entry.enabled === false,
+        constant: (entry.constant ?? entry.constantActive) === true,
+        position: legacyPosition ? position : worldBookNumber(position, 0),
+        depth: worldBookNumber(entry.depth, 0),
+        probability: worldBookNumber(entry.probability, 100),
+        useProbability: typeof entry.useProbability === "boolean" ? entry.useProbability : entry.probability != null,
+        role,
+        insertion_order: worldBookNumber(entry.insertion_order ?? entry.order, 50),
     };
 }
 
 export function parseWorldBookFromJson(text: string): WorldBookConfig | null {
     try {
-        const obj = JSON.parse(text);
-        if (!obj || typeof obj !== "object") return null;
+        const obj = worldBookRecord(JSON.parse(text.replace(/^\uFEFF/, "")));
+        if (!obj) return null;
+        if (UNSUPPORTED_WB_ROOT_FIELDS.some(field => field in obj)) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
 
-        if (isUnsupportedWorldBookFormat(obj)) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
-
-        const wb = createWorldBook(obj.name || "导入的世界书");
-        if (Array.isArray(obj.entries)) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const parsedEntries = obj.entries.map((e: any) => parseWorldBookEntry(e));
-
-            // Note: some formats might use dictionary-shaped entries.
-            wb.entries = parsedEntries;
-        } else if (typeof obj.entries === "object" && obj.entries !== null) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const parsedEntries = Object.values(obj.entries).map((e: any) => parseWorldBookEntry(e));
-            wb.entries = parsedEntries;
+        const rawEntries = Array.isArray(obj.entries) ? obj.entries : worldBookRecord(obj.entries);
+        if (!rawEntries) return null;
+        const entries: WorldBookEntry[] = [];
+        const ids = new Set<string>();
+        for (const [key, raw] of Object.entries(rawEntries)) {
+            const entry = parseWorldBookEntry(raw, { fallbackUid: Array.isArray(rawEntries) ? undefined : key });
+            if (!entry || ids.has(entry.uid)) return null;
+            ids.add(entry.uid);
+            entries.push(entry);
         }
 
-        return wb;
-    } catch (e) {
-        if (e instanceof Error && e.message === UNSUPPORTED_IMPORT_FORMAT) throw e;
+        const book = createWorldBook(typeof obj.name === "string" && obj.name.trim() ? obj.name : "导入的世界书");
+        return {
+            ...book,
+            id: worldBookId(obj.id) ?? book.id,
+            description: typeof obj.description === "string" ? obj.description : book.description,
+            createdAt: worldBookNumber(obj.createdAt, book.createdAt),
+            updatedAt: worldBookNumber(obj.updatedAt, book.updatedAt),
+            entries,
+        };
+    } catch (error) {
+        if (error instanceof Error && error.message === UNSUPPORTED_IMPORT_FORMAT) throw error;
         return null;
     }
 }

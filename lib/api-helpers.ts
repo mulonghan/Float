@@ -4,6 +4,7 @@
 
 import type { ApiConfig } from "./settings-types";
 import { pushApiLog } from "./api-log-store";
+import { assertLlmHttpResponse, describeLlmFailure, LlmHttpError, readLlmJson } from "./llm-http";
 
 const SIMPLE_ANTHROPIC_AUTO_MAX_TOKENS = 8192;
 
@@ -35,9 +36,22 @@ export function determineBaseUrl(config: { provider: string; baseUrl?: string })
  * Most providers use the OpenAI-compatible `/chat/completions` endpoint.
  * Google Gemini uses a different path, handled separately by callers.
  */
+function appendApiEndpoint(baseUrl: string, suffix: string, previousEndpoint?: RegExp): string {
+    const trimmed = baseUrl.trim();
+    const separator = trimmed.search(/[?#]/);
+    const trailing = separator < 0 ? "" : trimmed.slice(separator);
+    let base = (separator < 0 ? trimmed : trimmed.slice(0, separator)).replace(/\/+$/, "");
+    if (base.toLowerCase().endsWith(suffix)) return base + trailing;
+    if (previousEndpoint) base = base.replace(previousEndpoint, "");
+    return base + suffix + trailing;
+}
+
 export function buildChatCompletionsUrl(baseUrl: string): string {
-    if (baseUrl.endsWith("/chat/completions")) return baseUrl;
-    return `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+    return appendApiEndpoint(baseUrl, "/chat/completions");
+}
+
+export function buildAnthropicMessagesUrl(baseUrl: string): string {
+    return appendApiEndpoint(baseUrl, "/v1/messages", /(?:\/v1)?\/messages$|\/v1$/i);
 }
 
 /**
@@ -50,7 +64,7 @@ export function buildRequestHeaders(config: ApiConfig, baseUrl: string): Record<
         "Content-Type": "application/json",
     };
 
-    if (config.provider === "Anthropic" && !config.baseUrl) {
+    if (isNativeAnthropicApi(config)) {
         // Native Anthropic API uses x-api-key
         headers["x-api-key"] = config.apiKey;
         headers["anthropic-version"] = "2023-06-01";
@@ -68,14 +82,12 @@ export function buildRequestHeaders(config: ApiConfig, baseUrl: string): Record<
     return headers;
 }
 
-/**
- * Check if this provider uses the native Anthropic Messages API format
- * (not OpenAI-compatible chat/completions).
- * Only true for direct Anthropic API — proxies/relays that wrap Anthropic
- * behind OpenAI-compatible endpoints should use Custom provider + baseUrl.
- */
+/** An explicit Messages endpoint or a known Lingmou route uses Anthropic's native protocol. */
 export function isNativeAnthropicApi(config: ApiConfig): boolean {
-    return config.provider === "Anthropic" && !config.baseUrl;
+    if (config.provider !== "Anthropic") return false;
+    const base = config.baseUrl?.trim().split(/[?#]/, 1)[0].replace(/\/+$/, "") ?? "";
+    return !base || /\/messages$/i.test(base)
+        || /^(?:https?:\/\/api\.lmuai\.(?:com|ai)(?:\/v1)?|(?:https?:\/\/[^/]+)?\/lmu(?:\/v1)?)$/i.test(base);
 }
 
 /**
@@ -124,7 +136,7 @@ export function buildSimpleLLMRequest(
             .map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
         const systemMsg = messages.find(m => m.role === "system");
         return {
-            url: `${baseUrl.replace(/\/$/, "")}/messages`,
+            url: buildAnthropicMessagesUrl(baseUrl),
             headers,
             body: JSON.stringify({
                 model: config.defaultModel,
@@ -198,24 +210,12 @@ export async function simpleLLMCall(
 
         const bodySize = body.length;
         const bodyTokenEstimate = Math.ceil(bodySize / 3);
-        console.log("[simpleLLMCall] Request:", { url: fetchUrl.slice(0, 80), bodySize, bodyTokenEstimate, model: config.defaultModel });
+        console.log("[simpleLLMCall] Request:", { bodySize, bodyTokenEstimate });
 
         const res = await fetch(fetchUrl, { method: "POST", headers, body, signal: options?.signal });
 
-        if (!res.ok) {
-            const errText = await res.text().catch(() => "");
-            console.warn("[simpleLLMCall] API error:", res.status, errText.slice(0, 300));
-            pushApiLog({
-                characterName: options?.label,
-                source: "background",
-                model: config.defaultModel,
-                messages: messages.map(m => ({ role: m.role, content: m.content })),
-                rawResponse: `[API 错误 ${res.status}] ${errText.slice(0, 2000)}`,
-            });
-            return { content: null, error: `API 错误 ${res.status}: ${errText.slice(0, 200)}` };
-        }
-
-        const data = await res.json();
+        await assertLlmHttpResponse(res, fetchUrl, config.apiKey);
+        const data = await readLlmJson(res, fetchUrl, config.apiKey);
 
         // Extract content — try multiple response formats for maximum compatibility
         const content = extractLLMContent(data, config.provider);
@@ -230,22 +230,22 @@ export async function simpleLLMCall(
             usage: extractUsage(data),
         });
         if (!content) {
-            console.warn("[simpleLLMCall] Empty response. Keys:", JSON.stringify(Object.keys(data || {})),
-                "Full:", JSON.stringify(data).slice(0, 500));
             return { content: null, error: describeEmptyLLMResponse(data, finishReason, wasTruncated, config), finishReason, wasTruncated };
         }
 
         return { content, finishReason, wasTruncated };
     } catch (err) {
-        console.warn("[simpleLLMCall] fetch error:", err);
+        const message = describeLlmFailure(err, config.apiKey, options?.signal);
         pushApiLog({
             characterName: options?.label,
             source: "background",
             model: config.defaultModel,
             messages: messages.map(m => ({ role: m.role, content: m.content })),
-            rawResponse: `[请求失败] ${err instanceof Error ? err.message : String(err)}`,
+            rawResponse: "",
+            httpStatus: err instanceof LlmHttpError ? err.status : undefined,
+            failureKind: err instanceof LlmHttpError ? err.kind : undefined,
         });
-        return { content: null, error: `请求失败: ${err instanceof Error ? err.message : String(err)}` };
+        return { content: null, error: `请求失败: ${message}` };
     }
 }
 

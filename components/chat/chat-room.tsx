@@ -2753,7 +2753,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         return generateAndApplyChatGeneratedImage(message, characterId || session.contactId, { signal: guard?.signal })
             .catch(error => {
                 if (!isAbortLikeError(error)) {
-                    console.warn("[ImageGeneration] Failed to generate chat image:", error);
+                    console.warn("[ImageGeneration] Failed to generate chat image.");
                     const reason = error instanceof Error ? error.message : String(error);
                     setImageGenerationFailure(prev => prev ?? reason);
                 }

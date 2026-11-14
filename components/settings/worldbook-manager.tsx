@@ -7,6 +7,7 @@ import {
     saveWorldBooks,
     createWorldBook,
     parseWorldBookFromJson,
+    parseWorldBookEntry,
     loadBindingConfig,
     UNSUPPORTED_IMPORT_FORMAT,
 } from "@/lib/settings-storage";
@@ -296,6 +297,12 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                 const text = event.target?.result as string;
                 const parsed = parseWorldBookFromJson(text);
                 if (parsed) {
+                    const existing = books.find(book => book.id === parsed.id);
+                    if (existing) {
+                        setActiveBookId(existing.id);
+                        setImportError("已存在相同 ID 的世界书。现有内容与角色绑定已保留。");
+                        return;
+                    }
                     persist([parsed, ...books]);
                     setActiveBookId(parsed.id);
                 } else {
@@ -372,39 +379,19 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
     const entryFileInputRef = useRef<HTMLInputElement>(null);
     const entryImportModeRef = useRef<{ mode: "append" } | { mode: "replace"; uid: string } | null>(null);
 
-    const sanitizeEntryImport = (raw: unknown, fallbackUid: string): WorldBookEntry | null => {
-        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-        const obj = raw as Record<string, unknown>;
-        if (typeof obj.content !== "string" && typeof obj.comment !== "string" && typeof obj.key !== "string" && !Array.isArray(obj.key)) return null;
-        // 兼容酒馆世界书条目：key 可能是字符串数组
-        const key = Array.isArray(obj.key)
-            ? obj.key.filter((k): k is string => typeof k === "string").join(", ")
-            : (typeof obj.key === "string" ? obj.key : "");
-        return {
-            uid: fallbackUid,
-            key,
-            content: typeof obj.content === "string" ? obj.content : "",
-            comment: typeof obj.comment === "string" ? obj.comment : "",
-            use_regex: !!obj.use_regex,
-            disable: !!obj.disable,
-            constant: !!obj.constant,
-            position: typeof obj.position === "number" || typeof obj.position === "string"
-                ? obj.position as WorldBookEntry["position"]
-                : 4,
-            depth: typeof obj.depth === "number" ? obj.depth : 4,
-            probability: typeof obj.probability === "number" ? obj.probability : 100,
-            useProbability: !!obj.useProbability,
-            role: typeof obj.role === "number" ? obj.role : 0,
-            insertion_order: typeof obj.insertion_order === "number" ? obj.insertion_order : 50,
-        };
-    };
-
     const appendImportedEntries = (book: WorldBookConfig, raws: unknown[]) => {
-        const base = Date.now();
-        const appended = raws
-            .map((raw, i) => sanitizeEntryImport(raw, `wb-entry-${base + i}`))
-            .filter((entry): entry is WorldBookEntry => !!entry);
-        if (appended.length === 0) {
+        const appended: WorldBookEntry[] = [];
+        const ids = new Set(book.entries.map(entry => entry.uid));
+        for (const raw of raws) {
+            const entry = parseWorldBookEntry(raw);
+            if (!entry || ids.has(entry.uid)) {
+                setImportError("条目格式不正确，或条目 ID 已存在。替换现有条目请使用「替换」。");
+                return;
+            }
+            ids.add(entry.uid);
+            appended.push(entry);
+        }
+        if (!appended.length) {
             setImportError("JSON 里没有可识别的条目内容。");
             return;
         }
@@ -418,14 +405,12 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
     };
 
     const replaceImportedEntry = (book: WorldBookConfig, targetUid: string, raw: unknown) => {
-        const sanitized = sanitizeEntryImport(raw, targetUid);
+        const sanitized = parseWorldBookEntry(raw, { replaceUid: targetUid });
         if (!sanitized) {
             setImportError("JSON 里没有可识别的条目内容。");
             return;
         }
-        // 保留原 uid，只替换内容
-        const finalEntry = { ...sanitized, uid: targetUid };
-        updateBook(book.id, { entries: (book.entries || []).map(e => e.uid === targetUid ? finalEntry : e) });
+        updateBook(book.id, { entries: book.entries.map(e => e.uid === targetUid ? sanitized : e) });
     };
 
     const exportEntry = async (entry: WorldBookEntry) => {
@@ -680,8 +665,8 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                                     {entry.key || "(无触发词)"}
                                                                 </span>
                                                                 {entry.constant && <span className="ui-status-tag" data-variant="warning">常驻激活</span>}
-                                                                {entry.use_regex && !entry.constant && <span className="ui-status-tag" data-variant="action">正则触发</span>}
-                                                                {!entry.constant && !entry.use_regex && <span className="ui-status-tag" data-variant="success">关键词触发</span>}
+                                                                {entry.key.trim() && entry.use_regex && !entry.constant && <span className="ui-status-tag" data-variant="action">正则触发</span>}
+                                                                {entry.key.trim() && !entry.constant && !entry.use_regex && <span className="ui-status-tag" data-variant="success">关键词触发</span>}
                                                                 {entry.disable && <span className="ui-status-tag">已禁用</span>}
                                                             </div>
                                                         </div>
@@ -806,12 +791,12 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                         </div>
 
                                                         <div className="flex flex-col gap-1">
-                                                            <label className="menu-desc">备注 (Comment)</label>
+                                                            <label className="menu-desc">条目名称</label>
                                                             <input
                                                                 type="text"
                                                                 value={entry.comment}
                                                                 onChange={(e) => updateEntry(entry.uid, { comment: e.target.value })}
-                                                                placeholder="描述设定的作用..."
+                                                                placeholder="输入条目名称"
                                                                 className="ui-input ts-13"
                                                             />
                                                         </div>
