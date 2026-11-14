@@ -35,7 +35,7 @@ import { areTagsEqual, normalizePromptScopeTags, normalizeTags } from "./content
 import {
     readPresetsCache, writePresetsCache,
     writePresetsCacheAsync,
-    readWorldBooksCache, writeWorldBooksCache,
+    readWorldBooksCache, writeWorldBooksCache, insertWorldBook,
     readRegexesCache, writeRegexesCache,
     hydrateSettingsDb,
 } from "./settings-db";
@@ -473,36 +473,164 @@ export function parseWorldBookEntry(raw: unknown, options: { fallbackUid?: strin
     };
 }
 
-export function parseWorldBookFromJson(text: string): WorldBookConfig | null {
-    try {
-        const obj = worldBookRecord(JSON.parse(text.replace(/^\uFEFF/, "")));
-        if (!obj) return null;
-        if (UNSUPPORTED_WB_ROOT_FIELDS.some(field => field in obj)) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
+class WorldBookImportError extends Error {
+    constructor(message: string, readonly unsupported = false) {
+        super(message);
+    }
+}
 
-        const rawEntries = Array.isArray(obj.entries) ? obj.entries : worldBookRecord(obj.entries);
-        if (!rawEntries) return null;
-        const entries: WorldBookEntry[] = [];
-        const ids = new Set<string>();
-        for (const [key, raw] of Object.entries(rawEntries)) {
-            const entry = parseWorldBookEntry(raw, { fallbackUid: Array.isArray(rawEntries) ? undefined : key });
-            if (!entry || ids.has(entry.uid)) return null;
-            ids.add(entry.uid);
-            entries.push(entry);
+const LOREBOOK_FIELDS = new Set(["id", "name", "description", "enabled", "entries", "createdAt", "updatedAt"]);
+const LOREBOOK_ENTRY_FIELDS = new Set([
+    "id", "name", "content", "enabled", "priority", "position", "injectDepth",
+    "role", "keywords", "useRegex", "constantActive", "caseSensitive", "scanDepth",
+]);
+
+function reportUnknownFields(record: Record<string, unknown>, fields: Set<string>, scope: string, warnings: Set<string>): void {
+    const unknown = Object.keys(record).filter(field => !fields.has(field));
+    for (const field of unknown) warnings.add(`Float 未应用${scope}字段 ${field}。`);
+}
+
+function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean, warnings: Set<string>): Record<string, unknown> {
+    const entry = worldBookRecord(raw);
+    const prefix = `Lorebook 第 ${index + 1} 条`;
+    if (!entry || typeof entry.content !== "string") throw new WorldBookImportError(`${prefix}的 content 必须是字符串。`);
+    if (entry.name !== undefined && typeof entry.name !== "string") throw new WorldBookImportError(`${prefix}的 name 必须是字符串。`);
+    const keywords = entry.keywords ?? [];
+    if (!Array.isArray(keywords) || !keywords.every(word => typeof word === "string")) {
+        throw new WorldBookImportError(`${prefix}的 keywords 必须是字符串数组。`);
+    }
+    for (const field of ["enabled", "constantActive", "useRegex", "caseSensitive"]) {
+        if (entry[field] !== undefined && typeof entry[field] !== "boolean") {
+            throw new WorldBookImportError(`${prefix}的 ${field} 必须是布尔值。`);
         }
+    }
+    const priority = entry.priority ?? 0;
+    const depth = entry.injectDepth ?? 4;
+    if (typeof priority !== "number" || !Number.isSafeInteger(priority)) throw new WorldBookImportError(`${prefix}的 priority 必须是整数。`);
+    if (typeof depth !== "number" || !Number.isSafeInteger(depth) || depth < 0) throw new WorldBookImportError(`${prefix}的 injectDepth 必须是非负整数。`);
 
-        const book = createWorldBook(typeof obj.name === "string" && obj.name.trim() ? obj.name : "导入的世界书");
-        return {
+    let position: number;
+    let mappedDepth = depth;
+    switch (entry.position ?? "after_system_prompt") {
+        case "before_system_prompt": position = 0; break;
+        case "after_system_prompt": position = 1; break;
+        case "at_depth": position = 4; mappedDepth = Math.max(1, depth); break;
+        case "bottom_of_chat": position = 4; mappedDepth = 1; break;
+        case "top_of_chat":
+            position = 1;
+            warnings.add("Float 没有动态的聊天开头位置，top_of_chat 已映射到角色设定后。");
+            break;
+        default: throw new WorldBookImportError(`${prefix}使用了不支持的 position。`);
+    }
+
+    const role = entry.role ?? "user";
+    if (role !== "system" && role !== "user" && role !== "assistant") {
+        throw new WorldBookImportError(`${prefix}使用了不支持的 role。`);
+    }
+    if (entry.caseSensitive === true) warnings.add("Float 的世界书匹配不区分大小写，未应用 caseSensitive。");
+    if (entry.scanDepth !== undefined) warnings.add("Float 使用自己的关键词扫描范围，未应用 Lorebook 条目的 scanDepth。");
+    if (keywords.some(word => word.includes(","))) warnings.add("Float 使用逗号分隔关键词，含逗号的关键词会按多个关键词匹配。");
+    reportUnknownFields(entry, LOREBOOK_ENTRY_FIELDS, "条目", warnings);
+
+    return {
+        id: entry.id, name: entry.name, content: entry.content, keywords,
+        enabled: !bookDisabled && entry.enabled !== false,
+        constantActive: entry.constantActive, use_regex: entry.useRegex,
+        position, depth: mappedDepth, role,
+        // RikkaHub sorts descending by priority; Float sorts ascending by insertion_order.
+        insertion_order: priority === 0 ? 0 : -priority,
+    };
+}
+
+function readWorldBookImport(text: string): { book: WorldBookConfig; warnings: string[] } {
+    let root: Record<string, unknown> | null;
+    try {
+        root = worldBookRecord(JSON.parse(text.replace(/^\uFEFF/, "")));
+    } catch {
+        throw new WorldBookImportError("JSON 语法错误，请检查文件是否完整。");
+    }
+    if (!root) throw new WorldBookImportError("世界书 JSON 的根节点必须是对象。");
+
+    const lorebook = root.type === "lorebook";
+    let obj = root;
+    const warnings = new Set<string>();
+    if (lorebook) {
+        if (root.version !== 1) throw new WorldBookImportError("仅支持 version: 1 的 Lorebook。", true);
+        const data = worldBookRecord(root.data);
+        if (!data || !Array.isArray(data.entries)) throw new WorldBookImportError("Lorebook 缺少 data.entries 数组。");
+        if (typeof data.name !== "string") throw new WorldBookImportError("Lorebook 的 data.name 必须是字符串。");
+        if (data.enabled !== undefined && typeof data.enabled !== "boolean") throw new WorldBookImportError("Lorebook 的 data.enabled 必须是布尔值。");
+        obj = data;
+        reportUnknownFields(root, new Set(["version", "type", "data"]), "封装", warnings);
+        reportUnknownFields(data, LOREBOOK_FIELDS, "世界书", warnings);
+        if (data.enabled === false) warnings.add("原 Lorebook 整本已停用，导入的条目均设为停用。");
+    } else if (UNSUPPORTED_WB_ROOT_FIELDS.some(field => field in root)) {
+        throw new WorldBookImportError("该世界书包含 Float 不支持的整本匹配规则。", true);
+    }
+
+    const rawEntries = Array.isArray(obj.entries) ? obj.entries : worldBookRecord(obj.entries);
+    if (!rawEntries) throw new WorldBookImportError("世界书缺少有效的 entries 条目集合。");
+    const items = Object.entries(rawEntries);
+    if (!items.length) throw new WorldBookImportError("世界书没有条目，未导入。");
+
+    const entries: WorldBookEntry[] = [];
+    const ids = new Set<string>();
+    for (const [index, [key, raw]] of items.entries()) {
+        let entry: WorldBookEntry | null;
+        try {
+            const source = lorebook ? convertLorebookEntry(raw, index, obj.enabled === false, warnings) : raw;
+            entry = parseWorldBookEntry(source, { fallbackUid: Array.isArray(rawEntries) ? undefined : key });
+        } catch (error) {
+            if (error instanceof Error && error.message === UNSUPPORTED_IMPORT_FORMAT) {
+                throw new WorldBookImportError(`第 ${index + 1} 条含有 Float 不支持的匹配规则。`, true);
+            }
+            throw error;
+        }
+        if (!entry) throw new WorldBookImportError(`第 ${index + 1} 条格式不正确，请检查条目正文与字段。`);
+        if (ids.has(entry.uid)) throw new WorldBookImportError(`第 ${index + 1} 条的 ID 重复，未导入。`);
+        ids.add(entry.uid);
+        entries.push(entry);
+    }
+
+    const book = createWorldBook(typeof obj.name === "string" && obj.name.trim() ? obj.name : "导入的世界书");
+    return {
+        book: {
             ...book,
             id: worldBookId(obj.id) ?? book.id,
             description: typeof obj.description === "string" ? obj.description : book.description,
             createdAt: worldBookNumber(obj.createdAt, book.createdAt),
             updatedAt: worldBookNumber(obj.updatedAt, book.updatedAt),
             entries,
-        };
+        },
+        warnings: [...warnings],
+    };
+}
+
+export function parseWorldBookFromJson(text: string): WorldBookConfig | null {
+    try {
+        return readWorldBookImport(text).book;
     } catch (error) {
-        if (error instanceof Error && error.message === UNSUPPORTED_IMPORT_FORMAT) throw error;
+        if (error instanceof WorldBookImportError && error.unsupported) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
         return null;
     }
+}
+
+export async function importWorldBookFromJson(text: string): Promise<{ book: WorldBookConfig; warnings: string[] }> {
+    const result = readWorldBookImport(text);
+    await hydrateSettingsDb();
+    // A failed legacy migration can still leave an existing book in the in-memory cache.
+    if (readWorldBooksCache().some(book => book.id === result.book.id)) {
+        throw new WorldBookImportError("已存在相同 ID 的世界书，原有内容与角色绑定已保留。");
+    }
+    try {
+        await insertWorldBook(result.book);
+    } catch (error) {
+        if (error && typeof error === "object" && "name" in error && error.name === "ConstraintError") {
+            throw new WorldBookImportError("已存在相同 ID 的世界书，原有内容与角色绑定已保留。");
+        }
+        throw new WorldBookImportError("无法写入浏览器的 IndexedDB，未导入世界书。请检查可用存储空间和浏览器权限。");
+    }
+    return result;
 }
 
 // --- Regexes ──────────────────────────────────────────

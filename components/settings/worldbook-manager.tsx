@@ -6,10 +6,9 @@ import {
     loadWorldBooks,
     saveWorldBooks,
     createWorldBook,
-    parseWorldBookFromJson,
+    importWorldBookFromJson,
     parseWorldBookEntry,
     loadBindingConfig,
-    UNSUPPORTED_IMPORT_FORMAT,
 } from "@/lib/settings-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import type { WorldBookConfig, WorldBookEntry } from "@/lib/settings-types";
@@ -28,6 +27,7 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
     const [expandUid, setExpandUid] = useState<string | null>(null);
     const [importError, setImportError] = useState<string | null>(null);
 
+    const [importWarnings, setImportWarnings] = useState<string[]>([]);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const { setSubpageTitle, setOverrideBack, setSubpageRightAction } = useContext(SettingsContext);
@@ -287,37 +287,27 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
         }
     };
 
-    const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
+        e.target.value = "";
         if (!file) return;
+        setImportWarnings([]);
 
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            try {
-                const text = event.target?.result as string;
-                const parsed = parseWorldBookFromJson(text);
-                if (parsed) {
-                    const existing = books.find(book => book.id === parsed.id);
-                    if (existing) {
-                        setActiveBookId(existing.id);
-                        setImportError("已存在相同 ID 的世界书。现有内容与角色绑定已保留。");
-                        return;
-                    }
-                    persist([parsed, ...books]);
-                    setActiveBookId(parsed.id);
-                } else {
-                    setImportError("无法解析世界书文件，格式不正确。");
-                }
-            } catch (e) {
-                if (e instanceof Error && e.message === UNSUPPORTED_IMPORT_FORMAT) {
-                    setImportError("不支持该世界书格式");
-                } else {
-                    setImportError("无法解析世界书文件，格式不正确。");
-                }
-            }
-        };
-        reader.readAsText(file);
-        if (fileInputRef.current) fileInputRef.current.value = "";
+        let text: string;
+        try {
+            text = await file.text();
+        } catch {
+            setImportError("无法读取所选文件，请重新选择世界书 JSON。");
+            return;
+        }
+        try {
+            const { book, warnings } = await importWorldBookFromJson(text);
+            setBooks(loadWorldBooks());
+            setActiveBookId(book.id);
+            setImportWarnings(warnings);
+        } catch (error) {
+            setImportError(error instanceof Error ? error.message : "无法导入世界书。");
+        }
     };
 
     const handleExport = async (book: WorldBookConfig) => {
@@ -856,6 +846,18 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                         setConfirmDeleteTarget(null);
                     }}
                     onCancel={() => setConfirmDeleteTarget(null)}
+                />
+            )}
+
+            {!!importWarnings.length && !importError && (
+                <ConfirmDialog
+                    title="世界书已导入，有兼容性提示"
+                    message={importWarnings.join("\n")}
+                    icon={AlertCircle}
+                    confirmLabel="知道了"
+                    cancelLabel=""
+                    onConfirm={() => setImportWarnings([])}
+                    onCancel={() => setImportWarnings([])}
                 />
             )}
 

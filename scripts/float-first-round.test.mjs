@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
 import vm from "node:vm";
+import Dexie from "dexie";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import ts from "typescript";
 
 const require = createRequire(import.meta.url);
@@ -138,6 +140,130 @@ test("worldbook import and replacement share field normalization, preserving ide
     assert.equal(parseWorldBookFromJson('{"name":"invalid"}'), null);
     assert.equal(parseWorldBookFromJson(JSON.stringify({ entries: [entry, entry] })), null);
     assert.equal(parseWorldBookFromJson(JSON.stringify({ entries: [{ content: { invalid: true } }] })), null);
+});
+
+function worldBookStorageFixture() {
+    const indexedDB = new IDBFactory();
+    const connections = [];
+    const localData = new Map();
+    const globals = { window: { localStorage: {
+        getItem: key => localData.get(key) ?? null,
+        setItem: (key, value) => localData.set(key, value),
+        removeItem: key => localData.delete(key),
+    } } };
+    class TestDexie extends Dexie {
+        constructor(name) {
+            super(name, { indexedDB, IDBKeyRange });
+            connections.push(this);
+        }
+    }
+    return {
+        reload() {
+            for (const connection of connections.splice(0)) connection.close();
+            const load = makeLoader(globals, {
+                dexie: TestDexie,
+                "./kv-db": { registerKvMigration() {} },
+                "./builtin-preset": {},
+            });
+            return load("lib/settings-storage.ts");
+        },
+        connection: () => connections.at(-1),
+    };
+}
+
+const nativeBook = {
+    id: "native", name: "原生世界书", entries: [{
+        uid: "native-entry", comment: "", content: "原文\r\n第二行\n", key: "北岸",
+        constant: false, disable: false, use_regex: false, position: 0, probability: 0, insertion_order: 50,
+    }],
+};
+
+const lorebook = {
+    version: 1, type: "lorebook", data: {
+        id: "external", name: "外部世界书", enabled: true, entries: [
+            { id: "before", name: "", content: "  原文\r\n第二行\n", keywords: ["北岸", "灯塔"], enabled: true, constantActive: true, priority: 20, position: "before_system_prompt", role: "system", useRegex: true },
+            { id: "after", name: "设定", content: "关闭的条目", enabled: false, position: "after_system_prompt", priority: 10 },
+            { id: "depth", name: "深度", content: "聊天注入", position: "at_depth", injectDepth: 2, role: "assistant", scanDepth: 4, caseSensitive: true, futureRule: true },
+            { id: "top", content: "聊天开头", position: "top_of_chat" },
+            { id: "bottom", content: "最后消息之前", position: "bottom_of_chat", injectDepth: 6, role: "user" },
+        ],
+    },
+};
+
+test("native and external book imports survive a fresh IndexedDB connection", async () => {
+    const fixture = worldBookStorageFixture();
+    let storage = fixture.reload();
+    const nativeText = JSON.stringify(nativeBook);
+    const externalText = JSON.stringify(lorebook);
+    const native = await storage.importWorldBookFromJson(nativeText);
+    const external = await storage.importWorldBookFromJson(externalText);
+    assert.equal(native.warnings.length, 0);
+    assert.equal(native.book.entries[0].comment, "");
+    assert.equal(native.book.entries[0].probability, 0);
+    assert.equal(external.book.name, lorebook.data.name);
+    assert.deepEqual(JSON.parse(JSON.stringify(external.book.entries.map(entry => [
+        entry.uid, entry.comment, entry.content, entry.key, entry.disable, entry.constant,
+        entry.use_regex, entry.position, entry.depth, entry.role, entry.insertion_order,
+    ]))), [
+        ["before", "", "  原文\r\n第二行\n", "北岸,灯塔", false, true, true, 0, 4, 0, -20],
+        ["after", "设定", "关闭的条目", "", true, false, false, 1, 4, 1, -10],
+        ["depth", "深度", "聊天注入", "", false, false, false, 4, 2, 2, 0],
+        ["top", "", "聊天开头", "", false, false, false, 1, 4, 1, 0],
+        ["bottom", "", "最后消息之前", "", false, false, false, 4, 1, 1, 0],
+    ]);
+    for (const field of ["scanDepth", "caseSensitive", "futureRule", "top_of_chat"]) {
+        assert.match(external.warnings.join(" "), new RegExp(field));
+    }
+    assert.equal(JSON.stringify(lorebook), externalText);
+    storage = fixture.reload();
+    await storage.ensureSettingsStorageHydrated();
+    const persisted = storage.loadWorldBooks();
+    assert.equal(persisted.length, 2);
+    for (const { book } of [native, external]) {
+        const restored = persisted.find(candidate => candidate.id === book.id);
+        assert.equal(JSON.stringify(restored), JSON.stringify(book));
+        assert.equal(JSON.stringify(storage.parseWorldBookFromJson(JSON.stringify(restored))), JSON.stringify(book));
+    }
+});
+
+test("worldbook import is additive and rejects invalid or unsaved books", async () => {
+    const fixture = worldBookStorageFixture();
+    let storage = fixture.reload();
+    const nativeText = JSON.stringify(nativeBook);
+    const existing = await storage.importWorldBookFromJson(nativeText);
+    const replacement = { ...nativeBook, name: "替换内容" };
+    await assert.rejects(storage.importWorldBookFromJson(JSON.stringify(replacement)), /相同 ID/);
+    await assert.rejects(storage.importWorldBookFromJson("{"), /JSON 语法错误/);
+    await assert.rejects(storage.importWorldBookFromJson('{"entries":[]}'), /没有条目/);
+    await assert.rejects(storage.importWorldBookFromJson('{"version":1,"type":"lorebook","data":{}}'), /data.entries/);
+    await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({ ...lorebook, version: 2 })), /version: 1/);
+
+    const invalidEntry = { ...lorebook.data.entries[0], content: null };
+    await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({
+        ...lorebook, data: { ...lorebook.data, entries: [lorebook.data.entries[1], invalidEntry] },
+    })), /第 2 条的 content/);
+    assert.equal(storage.loadWorldBooks().length, 1);
+
+    const db = fixture.connection();
+    await db.table("worldBooks").add({ ...existing.book, id: "other-tab" });
+    await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({ ...nativeBook, id: "other-tab" })), /相同 ID/);
+
+    const failWrite = () => { throw new Error("simulated disk failure"); };
+    db.table("worldBooks").hook("creating", failWrite);
+    await assert.rejects(storage.importWorldBookFromJson(JSON.stringify(lorebook)), /无法写入浏览器/);
+    db.table("worldBooks").hook("creating").unsubscribe(failWrite);
+    assert.equal(storage.loadWorldBooks().length, 1);
+
+    const disabled = await storage.importWorldBookFromJson(JSON.stringify({
+        ...lorebook, data: { ...lorebook.data, enabled: false },
+    }));
+    assert.ok(disabled.book.entries.every(entry => entry.disable));
+    assert.match(disabled.warnings.join(" "), /整本已停用/);
+    assert.equal(storage.loadWorldBooks().length, 3);
+    storage = fixture.reload();
+    await storage.ensureSettingsStorageHydrated();
+    assert.equal(storage.loadWorldBooks().length, 3);
+    assert.equal(JSON.stringify(storage.loadWorldBooks().find(book => book.id === "native")), JSON.stringify(existing.book));
 });
 
 test("OpenAI and Anthropic resolve existing and base endpoints with the matching payload", () => {
