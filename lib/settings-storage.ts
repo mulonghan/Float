@@ -511,7 +511,9 @@ function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean
 
     let position: number;
     let mappedDepth = depth;
-    switch (entry.position ?? "after_system_prompt") {
+    const sourcePosition = entry.position ?? "after_system_prompt";
+    // Lorebook exports may use enum names or their serialized lowercase values.
+    switch (typeof sourcePosition === "string" ? sourcePosition.toLowerCase() : sourcePosition) {
         case "before_system_prompt": position = 0; break;
         case "after_system_prompt": position = 1; break;
         case "at_depth": position = 4; mappedDepth = Math.max(1, depth); break;

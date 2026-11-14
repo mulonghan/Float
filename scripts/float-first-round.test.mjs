@@ -226,6 +226,48 @@ test("native and external book imports survive a fresh IndexedDB connection", as
     }
 });
 
+test("all 14 entries in a Lorebook v1 export with uppercase positions import and persist", async () => {
+    const text = readFileSync(new URL("./fixtures/lorebook-uppercase-positions.json", import.meta.url), "utf8");
+    const source = JSON.parse(text);
+    const fixture = worldBookStorageFixture();
+    let storage = fixture.reload();
+    const { book, warnings } = await storage.importWorldBookFromJson(text);
+    assert.equal(book.name, source.data.name);
+    assert.equal(book.entries.length, 14);
+    assert.equal(book.entries[0].comment, "");
+    const positions = {
+        AFTER_SYSTEM_PROMPT: 1,
+        BEFORE_SYSTEM_PROMPT: 0,
+        AT_DEPTH: 4,
+        TOP_OF_CHAT: 1,
+        BOTTOM_OF_CHAT: 4,
+    };
+    for (const [index, original] of source.data.entries.entries()) {
+        const entry = book.entries[index];
+        assert.equal(entry.uid, original.id);
+        assert.equal(entry.comment, original.name);
+        assert.equal(entry.content, original.content);
+        assert.equal(entry.key, original.keywords.join(","));
+        assert.equal(entry.disable, !original.enabled);
+        assert.equal(entry.constant, original.constantActive);
+        assert.equal(entry.use_regex, original.useRegex);
+        assert.equal(entry.insertion_order, -original.priority);
+        assert.equal(entry.position, positions[original.position]);
+        assert.equal(entry.depth, original.position === "BOTTOM_OF_CHAT" ? 1 : original.injectDepth);
+        assert.equal(entry.role, original.role === "assistant" ? 2 : 1);
+    }
+    assert.match(warnings.join(" "), /top_of_chat/);
+
+    const lowercase = JSON.parse(text);
+    for (const entry of lowercase.data.entries) entry.position = entry.position.toLowerCase();
+    const parsedLowercase = storage.parseWorldBookFromJson(JSON.stringify(lowercase));
+    assert.deepEqual(book.entries, parsedLowercase.entries);
+
+    storage = fixture.reload();
+    await storage.ensureSettingsStorageHydrated();
+    assert.equal(JSON.stringify(storage.loadWorldBooks()[0]), JSON.stringify(book));
+});
+
 test("worldbook import is additive and rejects invalid or unsaved books", async () => {
     const fixture = worldBookStorageFixture();
     let storage = fixture.reload();
@@ -237,6 +279,9 @@ test("worldbook import is additive and rejects invalid or unsaved books", async 
     await assert.rejects(storage.importWorldBookFromJson('{"entries":[]}'), /没有条目/);
     await assert.rejects(storage.importWorldBookFromJson('{"version":1,"type":"lorebook","data":{}}'), /data.entries/);
     await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({ ...lorebook, version: 2 })), /version: 1/);
+    await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({
+        ...lorebook, data: { ...lorebook.data, entries: [{ ...lorebook.data.entries[0], position: "UNKNOWN_POSITION" }] },
+    })), /第 1 条使用了不支持的 position/);
 
     const invalidEntry = { ...lorebook.data.entries[0], content: null };
     await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({
