@@ -484,6 +484,23 @@ const LOREBOOK_ENTRY_FIELDS = new Set([
     "id", "name", "content", "enabled", "priority", "position", "injectDepth",
     "role", "keywords", "useRegex", "constantActive", "caseSensitive", "scanDepth",
 ]);
+const LOREBOOK_POSITIONS = ["before_system_prompt", "after_system_prompt", "at_depth", "bottom_of_chat", "top_of_chat"] as const;
+const LOREBOOK_ROLES = ["system", "user", "assistant"] as const;
+
+// Exporters use both uppercase enum names and lowercase serialized values.
+function normalizeLorebookEnum(value: unknown): string | undefined {
+    return typeof value === "string" ? value.toLowerCase() : undefined;
+}
+
+function readLorebookEnum<T extends string>(
+    entry: Record<string, unknown>, field: "position" | "role", fallback: T, allowed: readonly T[], prefix: string,
+): T {
+    if (entry[field] === undefined) return fallback;
+    const normalized = normalizeLorebookEnum(entry[field]);
+    const matched = allowed.find(value => value === normalized);
+    if (matched !== undefined) return matched;
+    throw new WorldBookImportError(`${prefix}使用了不支持的 ${field}。可导入的值：${allowed.join("、")}（大小写均可）。`);
+}
 
 function reportUnknownFields(record: Record<string, unknown>, fields: Set<string>, scope: string, warnings: Set<string>): void {
     const unknown = Object.keys(record).filter(field => !fields.has(field));
@@ -511,9 +528,8 @@ function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean
 
     let position: number;
     let mappedDepth = depth;
-    const sourcePosition = entry.position ?? "after_system_prompt";
-    // Lorebook exports may use enum names or their serialized lowercase values.
-    switch (typeof sourcePosition === "string" ? sourcePosition.toLowerCase() : sourcePosition) {
+    const sourcePosition = readLorebookEnum(entry, "position", "after_system_prompt", LOREBOOK_POSITIONS, prefix);
+    switch (sourcePosition) {
         case "before_system_prompt": position = 0; break;
         case "after_system_prompt": position = 1; break;
         case "at_depth": position = 4; mappedDepth = Math.max(1, depth); break;
@@ -522,13 +538,9 @@ function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean
             position = 1;
             warnings.add("Float 没有动态的聊天开头位置，top_of_chat 已映射到角色设定后。");
             break;
-        default: throw new WorldBookImportError(`${prefix}使用了不支持的 position。`);
     }
 
-    const role = entry.role ?? "user";
-    if (role !== "system" && role !== "user" && role !== "assistant") {
-        throw new WorldBookImportError(`${prefix}使用了不支持的 role。`);
-    }
+    const role = readLorebookEnum(entry, "role", "user", LOREBOOK_ROLES, prefix);
     if (entry.caseSensitive === true) warnings.add("Float 的世界书匹配不区分大小写，未应用 caseSensitive。");
     if (entry.scanDepth !== undefined) warnings.add("Float 使用自己的关键词扫描范围，未应用 Lorebook 条目的 scanDepth。");
     if (keywords.some(word => word.includes(","))) warnings.add("Float 使用逗号分隔关键词，含逗号的关键词会按多个关键词匹配。");
@@ -553,7 +565,7 @@ function readWorldBookImport(text: string): { book: WorldBookConfig; warnings: s
     }
     if (!root) throw new WorldBookImportError("世界书 JSON 的根节点必须是对象。");
 
-    const lorebook = root.type === "lorebook";
+    const lorebook = normalizeLorebookEnum(root.type) === "lorebook";
     let obj = root;
     const warnings = new Set<string>();
     if (lorebook) {

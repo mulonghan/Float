@@ -254,18 +254,54 @@ test("all 14 entries in a Lorebook v1 export with uppercase positions import and
         assert.equal(entry.insertion_order, -original.priority);
         assert.equal(entry.position, positions[original.position]);
         assert.equal(entry.depth, original.position === "BOTTOM_OF_CHAT" ? 1 : original.injectDepth);
-        assert.equal(entry.role, original.role === "assistant" ? 2 : 1);
+        assert.equal(entry.role, { SYSTEM: 0, USER: 1, ASSISTANT: 2 }[original.role]);
     }
     assert.match(warnings.join(" "), /top_of_chat/);
 
     const lowercase = JSON.parse(text);
-    for (const entry of lowercase.data.entries) entry.position = entry.position.toLowerCase();
+    assert.equal(source.data.entries[0].position, "AFTER_SYSTEM_PROMPT");
+    assert.equal(source.data.entries[0].role, "USER");
+    assert.deepEqual(new Set(source.data.entries.map(entry => entry.role)), new Set(["USER", "ASSISTANT", "SYSTEM"]));
+    for (const entry of lowercase.data.entries) {
+        entry.position = entry.position.toLowerCase();
+        entry.role = entry.role.toLowerCase();
+    }
     const parsedLowercase = storage.parseWorldBookFromJson(JSON.stringify(lowercase));
     assert.deepEqual(book.entries, parsedLowercase.entries);
+    assert.deepEqual(book.entries, storage.parseWorldBookFromJson(JSON.stringify({ ...source, type: "LOREBOOK" })).entries);
 
     storage = fixture.reload();
     await storage.ensureSettingsStorageHydrated();
     assert.equal(JSON.stringify(storage.loadWorldBooks()[0]), JSON.stringify(book));
+});
+
+test("the original Lorebook file imports and persists without storing it in the repo", {
+    skip: !process.env.FLOAT_LOREBOOK_TEST_FILE,
+}, async () => {
+    const text = readFileSync(process.env.FLOAT_LOREBOOK_TEST_FILE, "utf8");
+    const source = JSON.parse(text.replace(/^\uFEFF/, ""));
+    assert.equal(source.data.entries.length, 14);
+    assert.equal(source.data.entries[0].name, "");
+    assert.equal(source.data.entries[0].position, "AFTER_SYSTEM_PROMPT");
+    assert.equal(source.data.entries[0].role, "USER");
+    const fixture = worldBookStorageFixture();
+    let storage = fixture.reload();
+    const { book, warnings } = await storage.importWorldBookFromJson(text);
+    assert.equal(book.name, source.data.name);
+    assert.equal(book.entries.length, source.data.entries.length);
+    for (const [index, original] of source.data.entries.entries()) {
+        const entry = book.entries[index];
+        assert.ok(entry.uid === original.id && entry.comment === original.name && entry.content === original.content,
+            `Entry ${index + 1} must preserve its original ID, name, and content`);
+        assert.ok(entry.key === original.keywords.join(",") && entry.disable === !original.enabled
+            && entry.constant === original.constantActive, `Entry ${index + 1} must preserve its trigger settings`);
+        assert.equal(entry.position, 1);
+        assert.equal(entry.role, 1);
+    }
+    for (const field of ["sticky", "cooldown", "delay"]) assert.match(warnings.join(" "), new RegExp(field));
+    storage = fixture.reload();
+    await storage.ensureSettingsStorageHydrated();
+    assert.ok(JSON.stringify(storage.loadWorldBooks()[0]) === JSON.stringify(book), "All 14 imported entries must persist");
 });
 
 test("worldbook import is additive and rejects invalid or unsaved books", async () => {
@@ -282,6 +318,9 @@ test("worldbook import is additive and rejects invalid or unsaved books", async 
     await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({
         ...lorebook, data: { ...lorebook.data, entries: [{ ...lorebook.data.entries[0], position: "UNKNOWN_POSITION" }] },
     })), /第 1 条使用了不支持的 position/);
+    await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({
+        ...lorebook, data: { ...lorebook.data, entries: [{ ...lorebook.data.entries[0], role: "TOOL" }] },
+    })), /第 1 条使用了不支持的 role.*system、user、assistant/);
 
     const invalidEntry = { ...lorebook.data.entries[0], content: null };
     await assert.rejects(storage.importWorldBookFromJson(JSON.stringify({
