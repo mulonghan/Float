@@ -28,7 +28,8 @@ function makeLoader(globals = {}, stubs = {}) {
         const execute = vm.runInContext("(function (require, module, exports) {" + outputText + "\n})", context, { filename: file });
         execute(id => {
             if (Object.hasOwn(stubs, id)) return stubs[id];
-            return id.startsWith("./") ? load(resolve(file, "..", id + ".ts")) : require(id);
+            if (id.startsWith("@/")) return load(resolve(id.slice(2) + ".ts"));
+            return id.startsWith(".") ? load(resolve(file, "..", id + ".ts")) : require(id);
         }, module, module.exports);
         return module.exports;
     }
@@ -165,7 +166,7 @@ function worldBookStorageFixture() {
                 "./kv-db": { registerKvMigration() {} },
                 "./builtin-preset": {},
             });
-            return load("lib/settings-storage.ts");
+            return { ...load("lib/settings-storage.ts"), ...load("lib/worldbook-order.ts") };
         },
         connection: () => connections.at(-1),
     };
@@ -224,6 +225,173 @@ test("native and external book imports survive a fresh IndexedDB connection", as
         assert.equal(JSON.stringify(restored), JSON.stringify(book));
         assert.equal(JSON.stringify(storage.parseWorldBookFromJson(JSON.stringify(restored))), JSON.stringify(book));
     }
+});
+
+test("worldbook priorities display and edit by source across reloads without changing native order", async () => {
+    const fixture = worldBookStorageFixture();
+    let storage = fixture.reload();
+    const native = await storage.importWorldBookFromJson(JSON.stringify({
+        ...nativeBook, entries: [{ ...nativeBook.entries[0], insertion_order: 100 }],
+    }));
+    const imported = await storage.importWorldBookFromJson(JSON.stringify({
+        ...lorebook, data: { ...lorebook.data, entries: [{ ...lorebook.data.entries[0], priority: 100 }] },
+    }));
+    const legacy = { ...native.book.entries[0], insertion_order: -36 };
+    assert.equal(storage.worldBookOrderForDisplay(legacy), -36);
+    assert.equal(storage.worldBookOrderFromDisplay(legacy, -72), -72);
+    assert.equal(storage.worldBookOrderForDisplay(native.book.entries[0]), 100);
+    assert.equal(storage.worldBookOrderForDisplay(imported.book.entries[0]), 100);
+    assert.equal(imported.book.entries[0].insertion_order, -100);
+    for (const book of [native.book, imported.book]) {
+        const entry = book.entries[0];
+        entry.insertion_order = storage.worldBookOrderFromDisplay(entry, 125);
+    }
+    const table = fixture.connection().table("worldBooks");
+    const saved = new Promise((resolve, reject) => {
+        const onCreate = (id, _record, transaction) => {
+            if (id !== "external") return;
+            table.hook("creating").unsubscribe(onCreate);
+            transaction.on("complete", resolve);
+            transaction.on("error", reject);
+        };
+        table.hook("creating", onCreate);
+    });
+    storage.saveWorldBooks([native.book, imported.book]);
+    await saved;
+    assert.equal((await table.get("external")).entries[0].insertion_order, -125);
+    storage = fixture.reload();
+    await storage.ensureSettingsStorageHydrated();
+    const entries = storage.loadWorldBooks().map(book => book.entries[0]).sort((a, b) => a.insertion_order - b.insertion_order);
+    assert.deepEqual(Array.from(entries, entry => entry.insertion_order), [-125, 125]);
+    assert.deepEqual(Array.from(entries, storage.worldBookOrderForDisplay), [125, 125]);
+    for (const book of storage.loadWorldBooks()) {
+        const roundTrip = storage.parseWorldBookFromJson(JSON.stringify(book));
+        assert.equal(roundTrip.entries[0].orderSource, book.entries[0].orderSource);
+    }
+});
+
+test("worldbook diagnostics trace the real prompt without changing its text or sending a request", () => {
+    const forbidden = () => assert.fail("diagnostics must not access network or persistent writes");
+    const window = { localStorage: { setItem: forbidden, removeItem: forbidden } };
+    const globals = { fetch: forbidden, process: { env: {} } };
+    const load = makeLoader(globals, {
+        "./kv-db": { registerKvMigration() {}, registerDynamicPrefix() {}, kvSet: forbidden },
+        "../kv-db": { registerKvMigration() {}, registerDynamicPrefix() {}, kvSet: forbidden },
+        "./settings-db": {},
+        "./dwelling-storage": { readDwellingLayoutCache: () => null },
+        "./dwelling-engine": {}, "./chat-share": {},
+        "./character-world-storage": { formatCharacterRelationsForPrompt: () => "" },
+        "./prompt-time": {
+            getPromptTimestampOptionsForTimeContext: () => ({}),
+            resolvePromptTimeAware: value => value ?? false,
+        },
+    });
+    const { assemblePromptPayload, assembleGroupPromptPayload } = load("lib/llm-prompt-assembler.ts");
+    const { buildProviderRequest, toLlmRequestMessages } = load("lib/llm-provider-adapter.ts");
+    const { WorldBookTrace, recordWorldBookReport, readWorldBookReport, noteWorldBookSession } =
+        makeLoader({ window, fetch: forbidden })("lib/worldbook-diagnostics.ts");
+    const character = { id: "character", name: "Character", persona: "Fixture character", timeZone: "UTC" };
+    const entry = (uid, props) => ({
+        uid, comment: uid, content: `fixture ${uid} body`, position: 1, role: 1, depth: 4,
+        insertion_order: 50, constant: true, disable: false, key: "", ...props,
+    });
+    const book = { id: "book", name: "Book", entries: [
+        entry("native", { insertion_order: 100 }),
+        entry("lore", { insertion_order: -100, orderSource: "lorebook" }),
+        entry("before", { position: 0, role: 2, depth: 1 }),
+        entry("at-depth", { position: 4, role: 1, depth: 2 }),
+        entry("disabled", { disable: true }),
+        entry("inactive", { constant: false, key: "unmatched" }),
+        entry("empty", { content: "", position: 4 }),
+    ] };
+    const marker = identifier => ({ identifier, role: "system", enabled: true, marker: true, content: "" });
+    const preset = { name: "Preset", prompts: ["worldInfoBefore", "charDescription", "worldInfoAfter", "shortTermMemory"].map(marker) };
+    const history = ["user", "assistant", "user"].map((role, index) => ({
+        role, content: `private history ${index}`, createdAt: "2025-01-01T00:00:00Z",
+    }));
+    const base = { character, history, preset, worldBooks: [book], regexes: [], timeAware: false };
+    const fixtureConfig = { provider: "OpenAI", apiKey: "private-api-key", defaultModel: "fixture" };
+    const trace = new WorldBookTrace("session", character.name, preset, "单聊", ["book", "missing"], [book]);
+    const messages = assemblePromptPayload({ ...base, worldBookTrace: trace });
+    assert.deepEqual(messages, assemblePromptPayload(base));
+    const { body } = buildProviderRequest(fixtureConfig, preset, toLlmRequestMessages(messages));
+    const row = id => trace.report.entries.find(result => result.uid === id);
+    const system = body.messages.find(message => String(message.content).includes("fixture lore body"));
+    assert.equal(system.role, "system");
+    assert.ok(system.content.indexOf("fixture lore body") < system.content.indexOf("fixture native body"));
+    assert.equal(row("before").placement.role, "system");
+    assert.equal(row("native").placement.role, "system");
+    assert.notEqual(row("native").placement.depth, 4);
+    assert.equal(row("at-depth").placement.role, "user");
+    assert.equal(row("at-depth").placement.depth, 2);
+    assert.ok(body.messages.some(message => message.role === "user" && String(message.content).includes("fixture at-depth body")));
+    assert.equal(row("inactive").state, "inactive");
+    assert.equal(row("disabled").state, "disabled");
+    assert.equal(row("empty").state, "active");
+    assert.equal(row("empty").placement, undefined);
+    assert.match(row("empty").reason, /未生成/);
+    assert.equal(trace.report.entries.filter(result => result.placement).length, 4);
+    assert.equal(trace.report.missingBookIds[0], "missing");
+    noteWorldBookSession({ id: "session", contactId: "character" });
+    recordWorldBookReport(trace);
+    assert.equal(readWorldBookReport(), trace.report);
+    assert.doesNotMatch(JSON.stringify(readWorldBookReport()), /private history|private-api-key|fixture lore body|unmatched/);
+
+    for (const state of ["missing", "disabled"]) {
+        const prompts = state === "missing"
+            ? preset.prompts.filter(prompt => prompt.identifier !== "worldInfoAfter")
+            : preset.prompts.map(prompt => prompt.identifier === "worldInfoAfter" ? { ...prompt, enabled: false } : prompt);
+        const changed = { ...preset, prompts };
+        const diagnostic = new WorldBookTrace("session", character.name, changed, "单聊", ["book"], [book]);
+        const result = assemblePromptPayload({ ...base, preset: changed, worldBookTrace: diagnostic });
+        assert.equal(diagnostic.report.markers.worldInfoAfter, state);
+        assert.doesNotMatch(JSON.stringify(result), /fixture lore body/);
+        assert.match(diagnostic.report.entries.find(item => item.uid === "lore").reason, /缺少|关闭/);
+    }
+    const unbound = new WorldBookTrace("session", character.name, preset, "单聊", [], []);
+    assemblePromptPayload({ ...base, worldBooks: [], worldBookTrace: unbound });
+    assert.equal(unbound.report.entries.length, 0);
+    const off = new WorldBookTrace("session", character.name, preset, "单聊", ["book"], [book], true);
+    assemblePromptPayload({ ...base, worldBooks: [], worldBookTrace: off });
+    assert.equal(off.report.entries.find(item => item.uid === "lore").reason, "本次会话配置关闭了世界书");
+
+    const group = { ...base, members: [{ character, worldBooks: [book] }, { character: { ...character, id: "second" }, worldBooks: [book] }] };
+    const groupTrace = new WorldBookTrace("group", character.name, preset, "群聊", ["book"], [book, book]);
+    assert.deepEqual(assembleGroupPromptPayload({ ...group, worldBookTrace: groupTrace }), assembleGroupPromptPayload(group));
+    assert.equal(groupTrace.report.entries.find(item => item.uid === "lore").placement.location, "shared-after");
+    assert.equal(groupTrace.report.entries.filter(item => item.placement).length, 4);
+    const movedMarker = {
+        ...group,
+        members: [group.members[0], { ...group.members[1], worldBooks: [] }],
+        preset: { ...preset, prompts: ["worldInfoBefore", "shortTermMemory", "worldInfoAfter"].map(marker) },
+    };
+    const movedTrace = new WorldBookTrace("group", character.name, movedMarker.preset, "群聊", ["book"], [book]);
+    assembleGroupPromptPayload({ ...movedMarker, worldBookTrace: movedTrace });
+    assert.match(movedTrace.report.entries.find(item => item.uid === "lore").reason, /位于群聊成员区之后/);
+});
+
+test("diagnostic configuration reads can resolve legacy defaults without saving them", () => {
+    const forbidden = () => assert.fail("diagnostic reads must not write or fetch");
+    const legacy = [{ characterId: "character", presetId: "missing-preset", worldBookId: "book" }];
+    const storage = makeLoader({
+        window: { dispatchEvent: forbidden, localStorage: { setItem: forbidden } },
+        fetch: forbidden,
+        setTimeout: forbidden,
+    }, {
+        "./kv-db": {
+            registerKvMigration() {},
+            kvGet: key => key === "ai_phone_characters_v1"
+                ? JSON.stringify([{ id: "character", name: "Character", persona: "role" }])
+                : key === "ai_phone_char_settings_v1" ? JSON.stringify(legacy) : null,
+            kvSet: forbidden,
+        },
+        "./settings-db": { readPresetsCache: () => [], writePresetsCache: forbidden },
+    });
+    const { loadBindingConfig, resolveBinding, loadPresets } = storage("lib/settings-storage.ts");
+    const { loadCharacters } = storage("lib/character-storage.ts");
+    assert.equal(resolveBinding(loadBindingConfig({ persist: false }), "character", "chat").worldBookIds[0], "book");
+    assert.equal(loadPresets({ persist: false })[0].builtIn, true);
+    assert.equal(loadCharacters({ persist: false })[0].name, "Character");
 });
 
 test("all 14 entries in a Lorebook v1 export with uppercase positions import and persist", async () => {

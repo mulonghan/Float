@@ -1,3 +1,4 @@
+import { recordWorldBookReport, WorldBookTrace } from "./worldbook-diagnostics";
 // lib/chat-engine.ts
 
 import { createSseJsonParser } from "./sse-json";
@@ -347,6 +348,7 @@ export type DebugPromptRequestOptions = {
 };
 
 type ChatPromptBuildOptions = {
+    recordWorldBooks?: boolean;
     followUpCount?: number;
     followUpDelay?: number;
     timedWakeElapsedMinutes?: number;
@@ -1949,7 +1951,11 @@ export async function buildChatPromptMessages(
         )
         : "";
 
+    const worldBookTrace = options?.recordWorldBooks && typeof window !== "undefined"
+        ? new WorldBookTrace(session.id, character.name, preset, isOfflineMode ? "线下单聊" : "单聊", worldBookIds, allWorldBooks.filter(book => worldBookIds.includes(book.id)), promptProfile?.enableWorldBooks === false)
+        : undefined;
     const llmMessages = assemblePromptPayload({
+        worldBookTrace,
         character,
         history: promptHistory,
         preset,
@@ -2005,6 +2011,7 @@ export async function buildChatPromptMessages(
     }
     appendEmptyGenerateGuardMessage(llmMessages, config, historyForPrompt);
 
+    recordWorldBookReport(worldBookTrace);
     return { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled };
 }
 
@@ -2065,6 +2072,7 @@ export async function generateOfflineChatCompletion(
         {
             appTags: ["chat", "offline"],
             excludeOfflineSessionId: session.id,
+            recordWorldBooks: true,
         },
     );
     const summaryTag = preset?.story_summary_tag?.trim() || "summary";
@@ -2570,7 +2578,7 @@ async function generateChatCompletionCore(
     callbacks: ChatCompletionCallbacks | undefined,
     bailoutRef: ReplyBailoutRef,
 ): Promise<ChatCompletionResult> {
-    const { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled } = await buildChatPromptMessages(session, history, options);
+    const { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled } = await buildChatPromptMessages(session, history, { ...options, recordWorldBooks: (options?.appId ?? "chat") === "chat" });
     const requestAppTags = mergeAppTags(options?.appTags, options?.promptProfile?.appTags, options?.appId ?? "chat");
 
     // 追问有自己的排期时兜底（followup:key），这里只为普通回复生成挂单。

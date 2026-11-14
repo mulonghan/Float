@@ -166,7 +166,7 @@ function preserveCustomAppPresetPrompts(fresh: PresetConfig, previous: PresetCon
 
 // --- Presets ──────────────────────────────────────────
 
-export function loadPresets(): PresetConfig[] {
+export function loadPresets({ persist = true }: { persist?: boolean } = {}): PresetConfig[] {
     if (typeof window === "undefined") return [];
     try {
         const cachedPresets = readPresetsCache();
@@ -178,16 +178,16 @@ export function loadPresets(): PresetConfig[] {
         if (!existingBuiltin) {
             const builtin = createBuiltinPreset();
             presets.unshift(builtin);
-            savePresets(presets);
+            if (persist) savePresets(presets);
             shouldPersistCleanup = false;
         } else if ((existingBuiltin.builtInVersion ?? 0) < BUILTIN_PRESET_VERSION) {
             const fresh = preserveCustomAppPresetPrompts(createBuiltinPreset(), existingBuiltin);
             fresh.id = existingBuiltin.id;
             const idx = presets.indexOf(existingBuiltin);
             presets[idx] = fresh;
-            savePresets(presets);
+            if (persist) savePresets(presets);
             shouldPersistCleanup = false;
-        } else if (shouldPersistCleanup) {
+        } else if (persist && shouldPersistCleanup) {
             savePresets(presets);
         }
 
@@ -470,6 +470,7 @@ export function parseWorldBookEntry(raw: unknown, options: { fallbackUid?: strin
         useProbability: typeof entry.useProbability === "boolean" ? entry.useProbability : entry.probability != null,
         role,
         insertion_order: worldBookNumber(entry.insertion_order ?? entry.order, 50),
+        ...(entry.orderSource === "lorebook" ? { orderSource: "lorebook" as const } : {}),
     };
 }
 
@@ -482,7 +483,7 @@ class WorldBookImportError extends Error {
 const LOREBOOK_FIELDS = new Set(["id", "name", "description", "enabled", "entries", "createdAt", "updatedAt"]);
 const LOREBOOK_ENTRY_FIELDS = new Set([
     "id", "name", "content", "enabled", "priority", "position", "injectDepth",
-    "role", "keywords", "useRegex", "constantActive", "caseSensitive", "scanDepth",
+    "role", "keywords", "useRegex", "constantActive", "caseSensitive", "scanDepth", "sticky", "cooldown", "delay",
 ]);
 const LOREBOOK_POSITIONS = ["before_system_prompt", "after_system_prompt", "at_depth", "bottom_of_chat", "top_of_chat"] as const;
 const LOREBOOK_ROLES = ["system", "user", "assistant"] as const;
@@ -531,9 +532,16 @@ function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean
     const sourcePosition = readLorebookEnum(entry, "position", "after_system_prompt", LOREBOOK_POSITIONS, prefix);
     switch (sourcePosition) {
         case "before_system_prompt": position = 0; break;
-        case "after_system_prompt": position = 1; break;
+        case "after_system_prompt":
+            position = 1;
+            warnings.add("AFTER_SYSTEM_PROMPT 近似映射为角色设定后。单聊与群聊成员独享书依赖当前预设的 worldInfoAfter 标记。");
+            break;
         case "at_depth": position = 4; mappedDepth = Math.max(1, depth); break;
-        case "bottom_of_chat": position = 4; mappedDepth = 1; break;
+        case "bottom_of_chat":
+            position = 4;
+            mappedDepth = 1;
+            warnings.add("BOTTOM_OF_CHAT 近似映射为深度 1，实际位置取决于 Float 的聊天历史。");
+            break;
         case "top_of_chat":
             position = 1;
             warnings.add("Float 没有动态的聊天开头位置，top_of_chat 已映射到角色设定后。");
@@ -543,6 +551,9 @@ function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean
     const role = readLorebookEnum(entry, "role", "user", LOREBOOK_ROLES, prefix);
     if (entry.caseSensitive === true) warnings.add("Float 的世界书匹配不区分大小写，未应用 caseSensitive。");
     if (entry.scanDepth !== undefined) warnings.add("Float 使用自己的关键词扫描范围，未应用 Lorebook 条目的 scanDepth。");
+    for (const field of ["sticky", "cooldown", "delay"]) {
+        if (field in entry) warnings.add(`Float 未应用 Lorebook 的计时字段 ${field}。`);
+    }
     if (keywords.some(word => word.includes(","))) warnings.add("Float 使用逗号分隔关键词，含逗号的关键词会按多个关键词匹配。");
     reportUnknownFields(entry, LOREBOOK_ENTRY_FIELDS, "条目", warnings);
 
@@ -553,6 +564,7 @@ function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean
         position, depth: mappedDepth, role,
         // RikkaHub sorts descending by priority; Float sorts ascending by insertion_order.
         insertion_order: priority === 0 ? 0 : -priority,
+        orderSource: "lorebook",
     };
 }
 
@@ -1040,7 +1052,7 @@ function normalizeBindingConfig(config: BindingConfig): { config: BindingConfig;
     };
 }
 
-export function loadBindingConfig(): BindingConfig {
+export function loadBindingConfig({ persist = true }: { persist?: boolean } = {}): BindingConfig {
     if (typeof window === "undefined") return { ...DEFAULT_BINDING_CONFIG };
     try {
         const raw = kvGet(BINDINGS_KEY);
@@ -1048,13 +1060,13 @@ export function loadBindingConfig(): BindingConfig {
             // Attempt migration from legacy overrides
             const migrated = migrateLegacyOverrides();
             if (migrated) {
-                saveBindingConfig(migrated, false);
+                if (persist) saveBindingConfig(migrated, false);
                 return migrated;
             }
             return { ...DEFAULT_BINDING_CONFIG };
         }
         const normalized = normalizeBindingConfig(JSON.parse(raw) as BindingConfig);
-        if (normalized.changed) saveBindingConfig(normalized.config, false);
+        if (persist && normalized.changed) saveBindingConfig(normalized.config, false);
         return normalized.config;
     } catch {
         return { ...DEFAULT_BINDING_CONFIG };

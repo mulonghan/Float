@@ -16,6 +16,8 @@ import { SettingsContext } from "../phone-settings-app";
 import { BottomSheet, ConfirmDialog, TextExpandModal } from "@/components/ui/modal";
 import { SwipeActionRow, useSwipeActions } from "@/components/ui/swipe-actions";
 import { notifyMascotPageContext } from "@/lib/mascot-events";
+import { worldBookOrderForDisplay, worldBookOrderFromDisplay } from "@/lib/worldbook-order";
+import { WorldBookDiagnosticsPanel } from "./worldbook-diagnostics-panel";
 
 export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {}) {
     const [books, setBooks] = useState<WorldBookConfig[]>([]);
@@ -28,6 +30,7 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
     const [importError, setImportError] = useState<string | null>(null);
 
     const [importWarnings, setImportWarnings] = useState<string[]>([]);
+    const [showDiagnostics, setShowDiagnostics] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const { setSubpageTitle, setOverrideBack, setSubpageRightAction } = useContext(SettingsContext);
@@ -449,6 +452,16 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
         <div ref={wbContainerRef} className="flex flex-col gap-5 h-full">
             <input type="file" accept=".json" className="hidden" ref={fileInputRef} onChange={handleImport} />
             <input type="file" accept=".json" className="hidden" ref={entryFileInputRef} onChange={handleEntryImportFile} />
+            <div>
+                <button type="button" className="ui-btn ui-btn-outline" onClick={() => setShowDiagnostics(true)}>
+                    检查世界书注入
+                </button>
+            </div>
+            {showDiagnostics && (
+                <BottomSheet title="检查世界书注入" onClose={() => setShowDiagnostics(false)}>
+                    <WorldBookDiagnosticsPanel selectedBookId={viewMode === "detail" ? activeBookId : undefined} />
+                </BottomSheet>
+            )}
             {viewMode === "list" ? (
                 <>
                     <div className="flex items-center">
@@ -742,19 +755,39 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                             </div>
 
                                                             <div className="flex flex-col gap-1">
-                                                                <label className="menu-desc">权重优先级 (Order)</label>
+                                                                <label className="menu-desc" htmlFor={`wb-order-${entry.uid}`}>
+                                                                    {entry.orderSource === "lorebook" ? "Lorebook 优先级" : "Float 排序值"}
+                                                                </label>
                                                                 <input
+                                                                    id={`wb-order-${entry.uid}`}
+                                                                    key={entry.insertion_order}
                                                                     type="number"
-                                                                    value={entry.insertion_order ?? 50}
-                                                                    onChange={(e) => updateEntry(entry.uid, { insertion_order: parseInt(e.target.value) || 0 })}
+                                                                    step="any"
+                                                                    defaultValue={worldBookOrderForDisplay(entry)}
+                                                                    onBlur={(e) => {
+                                                                        const value = e.currentTarget.valueAsNumber;
+                                                                        if (!Number.isFinite(value)) {
+                                                                            e.currentTarget.value = String(worldBookOrderForDisplay(entry));
+                                                                            return;
+                                                                        }
+                                                                        if (value !== worldBookOrderForDisplay(entry)) {
+                                                                            updateEntry(entry.uid, { insertion_order: worldBookOrderFromDisplay(entry, value) });
+                                                                        }
+                                                                    }}
                                                                     className="ui-input ts-13"
                                                                 />
+                                                                <span className="menu-desc">
+                                                                    {entry.orderSource === "lorebook"
+                                                                        ? `优先级越大越靠前。同组混排使用 Float 排序值 ${entry.insertion_order}。`
+                                                                        : "同组内数值越小越靠前。未标记来源的旧条目沿用此值。"}
+                                                                </span>
                                                             </div>
                                                             <div className="flex flex-col gap-1">
                                                                 <label className="menu-desc">消息角色 (Role)</label>
                                                                 <select
                                                                     value={entry.role ?? 0}
                                                                     onChange={(e) => updateEntry(entry.uid, { role: parseInt(e.target.value) || 0 })}
+                                                                    disabled={entry.position !== 4}
                                                                     className="ui-select ts-13"
                                                                 >
                                                                     <option value={0}>System</option>
@@ -762,6 +795,9 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                                     <option value={2}>Assistant</option>
                                                                 </select>
                                                             </div>
+                                                            {entry.position !== 4 && (
+                                                                <p className="menu-desc col-span-full">在此位置以 System 注入。已保存的角色和深度将在切换到「按深度插入」后生效。</p>
+                                                            )}
                                                             <div className="col-span-full flex items-center gap-3">
                                                                 <span className="menu-desc !mt-0 shrink-0">触发概率 (Probability)</span>
                                                                 <label className="ui-checkbox-label whitespace-nowrap">

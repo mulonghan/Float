@@ -1,5 +1,6 @@
 // lib/llm-prompt-assembler.ts
 
+import type { WorldBookTrace } from "./worldbook-diagnostics";
 import { Character } from "./character-types";
 import { ChatMessage } from "./chat-storage";
 import type { StateValue } from "./chat-storage";
@@ -42,6 +43,7 @@ export type LLMMessage = {
 };
 
 export interface AssemblerInput {
+    worldBookTrace?: WorldBookTrace;
     character: Character;
     history: ChatMessage[];
     preset: PresetConfig | null;
@@ -409,6 +411,7 @@ function getMarkerContent(
     regexCtx?: RegexContext,
     characterRelations?: string,
     dwellingContext?: string,
+    trackWorldBook?: (entry: WorldBookEntry, text: string) => void,
 ): string | null {
     switch (identifier) {
         case "charDescription":
@@ -420,12 +423,20 @@ function getMarkerContent(
         case "worldInfoBefore": {
             if (wbBeforeEntries.length === 0) return null;
             const sorted = [...wbBeforeEntries].sort((a, b) => (a.insertion_order ?? 50) - (b.insertion_order ?? 50));
-            return sorted.map(e => regexGroups ? applyWorldInfoRegex(e.content, regexGroups, regexCtx) : e.content).join("\n\n");
+            return sorted.map(entry => {
+                const text = regexGroups ? applyWorldInfoRegex(entry.content, regexGroups, regexCtx) : entry.content;
+                trackWorldBook?.(entry, text);
+                return text;
+            }).join("\n\n");
         }
         case "worldInfoAfter": {
             if (wbAfterEntries.length === 0) return null;
             const sorted = [...wbAfterEntries].sort((a, b) => (a.insertion_order ?? 50) - (b.insertion_order ?? 50));
-            return sorted.map(e => regexGroups ? applyWorldInfoRegex(e.content, regexGroups, regexCtx) : e.content).join("\n\n");
+            return sorted.map(entry => {
+                const text = regexGroups ? applyWorldInfoRegex(entry.content, regexGroups, regexCtx) : entry.content;
+                trackWorldBook?.(entry, text);
+                return text;
+            }).join("\n\n");
         }
         case "calendarSchedule":
             return scheduleSummary?.trim() || null;
@@ -604,6 +615,26 @@ function isWBAtDepthPosition(entry: WorldBookEntry): boolean {
  * RELATIVE/ABSOLUTE injection_position 分类、标记条目定位。
  * 预设里没有的东西一律不注入——不存在人设/世界书/记忆的硬编码兜底。
  */
+export function getWorldBookMarkerStates(preset: PresetConfig | null) {
+    const order = preset ? buildProcessingOrder(preset) : [];
+    function state(id: "worldInfoBefore" | "worldInfoAfter") {
+        const marker = order.find(prompt => prompt.marker && prompt.identifier === id);
+        return !marker ? "missing" : isPromptEnabled(marker, preset?.prompt_order) ? "enabled" : "disabled";
+    }
+    return { worldInfoBefore: state("worldInfoBefore"), worldInfoAfter: state("worldInfoAfter") } as const;
+}
+
+function reportUnavailableMarkers(
+    trace: WorldBookTrace | undefined, before: WorldBookEntry[], after: WorldBookEntry[],
+): void {
+    if (!trace) return;
+    for (const [marker, entries] of [["worldInfoBefore", before], ["worldInfoAfter", after]] as const) {
+        const state = trace.report.markers[marker];
+        if (state === "enabled") continue;
+        for (const entry of entries) trace.exclude(entry, state === "missing" ? "预设缺少 " + marker : marker + " 已关闭");
+    }
+}
+
 export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     const { character, history, preset, worldBooks, regexes, userIdentity, userName = "User",
         longTermMemories, coreMemories, scheduleSummary } = input;
@@ -629,11 +660,15 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     const recentHistoryStr = input.worldBookActivationContext
         ?? history.slice(-10).map(m => m.content).join("\n");
     const activatedWBEntries: WorldBookEntry[] = [];
+    const trace = input.worldBookTrace;
+    if (trace) trace.report.markers = getWorldBookMarkerStates(preset);
     worldBooks.forEach(wb => {
         (wb.entries || []).forEach(entry => {
             if (entry.disable) return;
             if (input.activateAllWorldBooks || isWorldBookEntryActivated(entry, recentHistoryStr)) {
                 activatedWBEntries.push(entry);
+                trace?.activate(entry);
+                if (!preset) trace?.exclude(entry, "当前单聊未使用预设，未组装世界书");
             }
         });
     });
@@ -733,6 +768,7 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
         const wbBeforeEntries = activatedWBEntries.filter(e => isWBBeforePosition(e));
         const wbAfterEntries = activatedWBEntries.filter(e => !isWBBeforePosition(e) && !isWBAtDepthPosition(e));
         const wbAtDepthEntries = activatedWBEntries.filter(e => isWBAtDepthPosition(e));
+        reportUnavailableMarkers(trace, wbBeforeEntries, wbAfterEntries);
 
         let orderIdx = 0;
         let afterChatHistory = false;
@@ -760,6 +796,7 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
 
             if (p.marker) {
 
+                const fragments: { entry: WorldBookEntry; text: string }[] = [];
                 let markerContent = getMarkerContent(
                     p.identifier, character, userPersonaText,
                     wbBeforeEntries, wbAfterEntries,
@@ -769,6 +806,7 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
                     regexes, { macroEngine: engine, activeTags },
                     input.characterRelations,
                     input.dwellingContext,
+                    trace ? (entry, text) => fragments.push({ entry, text }) : undefined,
                 );
                 if (markerContent) {
                     // Expand macros in marker content ({{char}}/{{user}} in char descriptions etc.)
@@ -793,6 +831,7 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
                                 marker: p.identifier,
                             });
                         }
+                        if (fragments.length) trace?.track(blocks[blocks.length - 1], fragments);
                     }
                 }
                 continue;
@@ -869,6 +908,7 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
                 order: entry.insertion_order ?? 50,
                 marker: `WB: ${entry.key}`,
             });
+            trace?.track(blocks[blocks.length - 1], [{ entry, text: content }]);
         });
 
     }
@@ -1052,6 +1092,7 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
             ? { depth: b.depth, activeTags, history: true }
             : { activeTags };
         const processedText = b.role === "tool" ? b.text : applyInputRegex(b.text, regexes, inputCtx);
+        input.worldBookTrace?.checkBlock(b, processedText, b.marker, b.role, b.depth);
         const carriesNativeToolData = b.role === "tool" || Boolean(b.toolCalls?.length);
 
         const canMerge = preset
@@ -1583,6 +1624,7 @@ export interface GroupMemberData {
 }
 
 export interface GroupAssemblerInput {
+    worldBookTrace?: WorldBookTrace;
     members: GroupMemberData[];
     history: ChatMessage[];
     preset: PresetConfig | null;
@@ -1745,6 +1787,8 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
         userName = "User", groupName, memberNames,
         recentBlocks, unifiedRecentItems,
     } = input;
+    const trace = input.worldBookTrace;
+    if (trace) trace.report.markers = getWorldBookMarkerStates(preset);
     const activeTags = input.appTags ? [...input.appTags] : ["group_chat"];
     const resolvedUserName = userIdentity?.name || userName;
     const blocks: PromptBlock[] = [];
@@ -1802,7 +1846,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
     }
     const isSharedBook = (id: string): boolean => (bookBinderIds.get(id)?.size ?? 0) >= 2;
     const atDepthInjections: { entry: WorldBookEntry; engine: MacroEngine }[] = [];
-    const sharedAfterBlocks: { text: string; marker: string }[] = [];
+    const sharedAfterBlocks: { text: string; marker: string; fragments: { entry: WorldBookEntry; text: string }[] }[] = [];
 
     const seenSharedBooks = new Set<string>();
     for (const m of members) {
@@ -1813,28 +1857,30 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
             applyTimeContextToMacroEngine(bookEngine, groupTimeContext);
             const activated = (wb.entries || []).filter(entry =>
                 !entry.disable && isWorldBookEntryActivated(entry, activationContext));
+            if (trace) activated.forEach(entry => trace.activate(entry));
             activated.filter(e => isWBAtDepthPosition(e)).forEach(entry => {
                 atDepthInjections.push({ entry, engine: bookEngine });
             });
-            const renderJoined = (entries: WorldBookEntry[]): string => {
+            const renderJoined = (entries: WorldBookEntry[]) => {
                 const sorted = [...entries].sort((a, b) => (a.insertion_order ?? 50) - (b.insertion_order ?? 50));
-                return postProcessTrim(bookEngine.expand(
-                    sorted.map(e => applyWorldInfoRegex(e.content, regexes, { macroEngine: bookEngine, activeTags })).join("\n\n"),
-                )).trim();
+                const fragments = sorted.map(entry => ({ entry, text: applyWorldInfoRegex(entry.content, regexes, { macroEngine: bookEngine, activeTags }) }));
+                const text = postProcessTrim(bookEngine.expand(fragments.map(fragment => fragment.text).join("\n\n"))).trim();
+                return { text, fragments };
             };
-            const beforeText = renderJoined(activated.filter(e => isWBBeforePosition(e)));
-            if (beforeText) {
+            const before = renderJoined(activated.filter(e => isWBBeforePosition(e)));
+            if (before.text) {
                 blocks.push({
-                    text: beforeText,
+                    text: before.text,
                     role: "system",
                     depth: beforeHistoryDepth,
                     order: orderIdx++,
                     marker: `sharedWorldInfo(before): ${wb.name || wb.id}`,
                 });
+                trace?.track(blocks[blocks.length - 1], before.fragments);
             }
-            const afterText = renderJoined(activated.filter(e => !isWBBeforePosition(e) && !isWBAtDepthPosition(e)));
-            if (afterText) {
-                sharedAfterBlocks.push({ text: afterText, marker: `sharedWorldInfo(after): ${wb.name || wb.id}` });
+            const after = renderJoined(activated.filter(e => !isWBBeforePosition(e) && !isWBAtDepthPosition(e)));
+            if (after.text) {
+                sharedAfterBlocks.push({ ...after, marker: `sharedWorldInfo(after): ${wb.name || wb.id}` });
             }
         }
     }
@@ -1885,6 +1931,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
                 if (entry.disable) return;
                 if (isWorldBookEntryActivated(entry, activationContext)) {
                     activatedEntries.push(entry);
+                    trace?.activate(entry);
                 }
             });
         });
@@ -1897,6 +1944,8 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
 
         // Build member content by iterating preset markers in order
         const sections: string[] = [];
+        const fragments: { entry: WorldBookEntry; text: string }[] = [];
+        reportUnavailableMarkers(trace, wbBeforeEntries, wbAfterEntries);
 
         if (preset) {
             for (const p of processingOrder) {
@@ -1908,6 +1957,13 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
 
                 // shortTermMemory marker: append per-member short-term blocks, then stop
                 if (p.identifier === "shortTermMemory" || p.identifier === "chatHistory") {
+                    if (trace) {
+                        for (const [id, entries] of [["worldInfoBefore", wbBeforeEntries], ["worldInfoAfter", wbAfterEntries]] as const) {
+                            if (trace.report.markers[id] === "enabled" && processingOrder.indexOf(p) < processingOrder.findIndex(marker => marker.marker && marker.identifier === id)) {
+                                for (const entry of entries) trace.exclude(entry, id + " 位于群聊成员区之后");
+                            }
+                        }
+                    }
                     break; // markers after divider are feature prompts, not member data
                 }
 
@@ -1920,6 +1976,8 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
                     m.longTermMemories,
                     regexes, { macroEngine: engine, activeTags },
                     m.characterRelations,
+                    undefined,
+                    trace ? (entry, text) => fragments.push({ entry, text }) : undefined,
                 );
                 if (markerContent) {
                     markerContent = engine.expand(markerContent);
@@ -1945,6 +2003,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
                 order: orderIdx++,
                 marker: `member:${char.name}`,
             });
+            if (fragments.length) trace?.track(blocks[blocks.length - 1], fragments);
         }
     }
 
@@ -1957,6 +2016,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
             order: orderIdx++,
             marker: b.marker,
         });
+        trace?.track(blocks[blocks.length - 1], b.fragments);
     }
     // 2.6 at-depth 世界书条目(独享+共享,均已去重):照单聊规则插入聊天历史对应深度
     for (const inj of atDepthInjections) {
@@ -1971,6 +2031,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
             order: inj.entry.insertion_order ?? 50,
             marker: `WB: ${inj.entry.key}`,
         });
+        trace?.track(blocks[blocks.length - 1], [{ entry: inj.entry, text: content }]);
     }
 
     // 3. Feature-tagged prompts from preset
@@ -2220,6 +2281,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
             ? { depth: b.depth, activeTags, history: true }
             : { activeTags };
         const processedText = b.role === "tool" ? b.text : applyInputRegex(b.text, regexes, inputCtx);
+        input.worldBookTrace?.checkBlock(b, processedText, b.marker, b.role, b.depth);
         const carriesNativeToolData = b.role === "tool" || Boolean(b.toolCalls?.length);
 
         const canMerge = b.fromHistory && finalPayload.length > 0 &&
