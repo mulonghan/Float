@@ -5,12 +5,13 @@
 // 为什么要流式：iOS Safari 对迟迟收不到任何响应数据的请求，大约 60 秒就判定超时断开。
 // 非流式要等模型整段写完才返回，长生成在 iPhone 上会必挂；流式一开始就陆续有数据。
 //
-// 退回规则：什么都没收到就失败（接口或中转不支持 SSE、HTTP 报错、流里没有任何增量等），
+// 退回规则：什么都没收到就失败（接口或中转不支持 SSE、流里没有任何增量等），
 // 退回 simpleLLMCall 再请求一次，报错信息和以前完全一样；
 // 已经收到正文或思考内容后连接断开，或调用方主动中止，按失败返回，不再重试（避免同一次长生成计费两次）。
 
 import type { ApiConfig } from "./settings-types";
 import { pushApiLog } from "./api-log-store";
+import { assertLlmHttpResponse, assertLlmStreamChunk, describeLlmFailure, LlmHttpError } from "./llm-http";
 import {
     buildSimpleLLMRequest,
     describeEmptyLLMResponse,
@@ -55,6 +56,7 @@ async function simpleLLMStreamCall(
     let usage: ReturnType<typeof extractUsage>;
 
     const handleChunk = (parsed: unknown) => {
+        assertLlmStreamChunk(parsed, config.apiKey);
         const delta = parseProviderStreamDelta(request.providerKind, parsed);
         if (delta.content) {
             content += delta.content;
@@ -78,7 +80,8 @@ async function simpleLLMStreamCall(
             body: request.body,
             signal: options?.signal,
         });
-        if (!res.ok || !res.body) return null;
+        await assertLlmHttpResponse(res, request.url, config.apiKey);
+        if (!res.body) return null;
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -100,15 +103,16 @@ async function simpleLLMStreamCall(
         }
         for (const parsed of sseParser.flush()) handleChunk(parsed);
     } catch (err) {
-        if (!started && !options?.signal?.aborted) return null;
-        const message = err instanceof Error ? err.message : String(err);
-        console.warn("[simpleLLMStreamCall] stream error:", err);
+        if (!started && !options?.signal?.aborted && !(err instanceof LlmHttpError && err.kind !== "format")) return null;
+        const message = describeLlmFailure(err, config.apiKey, options?.signal);
         pushApiLog({
             characterName: options?.label,
             source: "background",
             model: config.defaultModel,
             messages: messages.map(m => ({ role: m.role, content: m.content })),
-            rawResponse: `[请求失败] ${message}`,
+            rawResponse: "",
+            httpStatus: err instanceof LlmHttpError ? err.status : undefined,
+            failureKind: err instanceof LlmHttpError ? err.kind : undefined,
         });
         return { content: null, error: `请求失败: ${message}` };
     }

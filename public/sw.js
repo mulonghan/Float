@@ -1,4 +1,5 @@
-const CACHE_VERSION = "ai-phone-pwa-v12";
+const CACHE_VERSION = "ai-phone-pwa-v13";
+const OWN_CACHE_PATTERN = /^ai-phone-pwa-v\d+-(?:static|runtime)$/;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
@@ -22,7 +23,7 @@ self.addEventListener("activate", (event) => {
     caches.keys()
       .then((keys) => Promise.all(
         keys
-          .filter((key) => !key.startsWith(CACHE_VERSION))
+          .filter((key) => OWN_CACHE_PATTERN.test(key) && key !== STATIC_CACHE && key !== RUNTIME_CACHE)
           .map((key) => caches.delete(key))
       ))
       // 刷新预缓存的 "/" 快照：它是离线导航的最终兜底，若停留在旧部署版本，
@@ -33,11 +34,15 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+function isApiRequest(request) {
+  const { origin, pathname } = new URL(request.url);
+  return origin === self.location.origin && /^\/(?:api|lmu)(?:\/|$)/i.test(pathname);
+}
+
 function isCacheableRequest(request) {
   if (request.method !== "GET") return false;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return false;
-  if (url.pathname.startsWith("/api/")) return false;
   if (url.pathname.startsWith("/_next/static/")) return true;
   return ["font", "image", "script", "style", "worker"].includes(request.destination);
 }
@@ -173,6 +178,7 @@ self.addEventListener("notificationclick", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const { request } = event;
+  if (isApiRequest(request)) return;
   if (request.mode === "navigate") {
     event.respondWith(networkFirst(request));
     return;

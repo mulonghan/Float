@@ -1,6 +1,7 @@
 // lib/debug-store.ts
 // Lightweight global store: ChatRoom writes current session+messages, DebugPromptPanel reads.
 
+import { noteWorldBookSession } from "./worldbook-diagnostics";
 import type { ChatSession, ChatMessage } from "./chat-storage";
 import type { LLMContentPart } from "./llm-prompt-assembler";
 
@@ -28,6 +29,7 @@ const _promptListeners = new Set<() => void>();
 
 export function setDebugChatState(s: DebugChatState): void {
     _state = s;
+    if (s) noteWorldBookSession(s.session);
     _listeners.forEach(fn => fn());
 }
 

@@ -189,6 +189,14 @@ export async function writePresetsCacheAsync(presets: PresetConfig[]): Promise<v
     }
 }
 
+export async function insertWorldBook(book: WorldBookConfig): Promise<void> {
+    const persisted = await settingsDb.transaction("rw", settingsDb.worldBooks, async () => {
+        await settingsDb.worldBooks.add(book);
+        return settingsDb.worldBooks.toArray();
+    });
+    _worldBooks = [book, ...persisted.filter(existing => existing.id !== book.id)];
+}
+
 export function writeWorldBooksCache(books: WorldBookConfig[]): void {
     _worldBooks = books;
     if (!_hydrated && typeof window !== "undefined") {

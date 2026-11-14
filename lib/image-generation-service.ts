@@ -236,12 +236,31 @@ async function fetchImageUrlAsBase64(url: string, signal?: AbortSignal): Promise
   return { b64: cleaned.b64, mimeType: cleaned.mimeType || blob.type || "image/png" };
 }
 
+class ImageGenerationRejectedError extends Error {}
+
+function imageRequestFailure(status: number, detail?: string): Error {
+  const message = detail || "生图请求失败 (HTTP " + status + ")";
+  return status >= 400 && status < 500 && status !== 408
+    ? new ImageGenerationRejectedError(message)
+    : new Error(message);
+}
+
+function imageResultUnknown(error: unknown, signal?: AbortSignal, timeoutMessage?: string): Error {
+  if (error instanceof ImageGenerationRejectedError) return error;
+  const detail = signal?.aborted
+    ? "已停止等待生图响应"
+    : timeoutMessage || (error instanceof TypeError
+      ? "生图连接失败或响应被浏览器拦截"
+      : error instanceof Error && error.name !== "AbortError" ? error.message : "生图连接中断");
+  return new Error(detail + "。生成结果未知，可能已经计费。请先检查服务商的用量记录，再决定是否重新生成。");
+}
+
 async function parseImageGenerationResponse(res: Response, signal?: AbortSignal): Promise<ImageGenerationApiResponse> {
   throwIfAborted(signal);
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`生图 API 错误 ${res.status}: ${text.slice(0, 600)}`);
+    throw imageRequestFailure(res.status, `生图 API 错误 ${res.status}: ${text.slice(0, 600)}`);
   }
 
   if (contentType.startsWith("image/")) {
@@ -363,62 +382,26 @@ async function generateImageDirect(params: {
   if (signal) signal.addEventListener("abort", onOuterAbort, { once: true });
   const totalTimer = setTimeout(() => controller.abort(), 360_000);
   try {
-    return await parseImageGenerationResponse(await fetch(url, { method: "POST", headers, body, signal: controller.signal }), signal);
+    return await parseImageGenerationResponse(await fetch(url, { method: "POST", headers, body, redirect: "error", signal: controller.signal }), controller.signal);
   } catch (error) {
-    if (controller.signal.aborted && !signal?.aborted) {
-      throw new Error(proxyBaseUrl ? "生图代理超时（360 秒未返回）" : "生图请求超时（360 秒未返回）");
-    }
-    if (error instanceof TypeError) {
-      throw new Error(proxyBaseUrl ? "生图代理连接失败" : "浏览器直连失败：该 API 可能未允许跨域请求。");
-    }
-    throw error;
+    throw imageResultUnknown(error, signal, controller.signal.aborted ? "生图请求已超时或连接中断（最长 360 秒）" : undefined);
   } finally {
     clearTimeout(totalTimer);
     if (signal) signal.removeEventListener("abort", onOuterAbort);
   }
 }
 
-// 「代理中转」模式:配置了通用代理(CF Worker)就只走它——用户选择什么模式就走什么链路,
-// 不做隐藏回落(不再兜底到 Netlify 函数,那会消耗站点额度且有 60s 上限)。
-// 常量未配置时保留旧的 Netlify 心跳流式路由(自部署无 Worker 的场景)。
-//
-// Netlify 心跳路由是站点额度的最大计算开销之一(每张图占用函数 30~120s),而不少
-// 选了「服务端转发」的用户,其生图 API 其实允许跨域。因此走 Netlify 前先试一次
-// 浏览器直连:直连因 CORS 失败(预检被拒,真实请求未发出,上游不会计费)才回落
-// 到服务端,并按 baseUrl 记住失败结果,本次会话内不再重复探测。
-const directCorsFailedBaseUrls = new Set<string>();
-
-async function generateImageViaServerOrProxy(params: {
-  settings: ImageGenerationSettings;
-  prompt: string;
-  referenceImageDataUrl: string | null;
-  signal?: AbortSignal;
-}): Promise<ImageGenerationApiResponse> {
-  if (IMAGE_GEN_PROXY_URL) {
-    try {
-      return await generateImageDirect({ ...params, proxyBaseUrl: IMAGE_GEN_PROXY_URL });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("生图代理连接失败")) {
-        throw new Error("生图代理连接失败:当前网络可能无法访问代理服务器(部分地区需开启代理),或稍后重试。");
-      }
-      throw error;
+// 发送之前选定唯一链路。/lmu 已经是明确的本站反向代理。
+function generateImageViaServerOrProxy(params: Parameters<typeof generateImageViaServer>[0]): Promise<ImageGenerationApiResponse> {
+  if (typeof window !== "undefined") {
+    const target = new URL(params.settings.baseUrl, window.location.href);
+    if (target.origin === window.location.origin && /^\/lmu(?:\/|$)/.test(target.pathname)) {
+      return generateImageDirect(params);
     }
   }
-  const baseUrlKey = normalizeBaseUrl(params.settings.baseUrl);
-  if (!directCorsFailedBaseUrls.has(baseUrlKey)) {
-    try {
-      return await generateImageDirect(params);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // 只有连接层失败(CORS/断网)才回落;API 自身的错误(密钥无效、余额不足等)
-      // 说明直连是通的,换服务端转发也会得到同样错误,直接抛出避免重复计费。
-      if (!message.includes("浏览器直连失败")) throw error;
-      throwIfAborted(params.signal);
-      directCorsFailedBaseUrls.add(baseUrlKey);
-    }
-  }
-  return generateImageViaServer(params);
+  return IMAGE_GEN_PROXY_URL
+    ? generateImageDirect({ ...params, proxyBaseUrl: IMAGE_GEN_PROXY_URL })
+    : generateImageViaServer(params);
 }
 
 async function generateImageViaServer(params: {
@@ -440,6 +423,7 @@ async function generateImageViaServer(params: {
     // 避免托管平台对缓冲响应的 10~26s 超时把慢生图(30~120s)掐成 504。
     const res = await fetch("/api/image-generation", {
       method: "POST",
+      redirect: "error",
       headers: { "Content-Type": "application/json", "x-stream-heartbeat": "1" },
       signal: controller.signal,
       body: JSON.stringify({
@@ -455,6 +439,7 @@ async function generateImageViaServer(params: {
     throwIfAborted(signal);
 
     type ServerImagePayload = { httpStatus?: number; b64?: string; mimeType?: string; revisedPrompt?: string; error?: string };
+    if (!res.ok) throw imageRequestFailure(res.status);
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
     let data: ServerImagePayload;
     if (contentType.includes("text/plain")) {
@@ -492,17 +477,19 @@ async function generateImageViaServer(params: {
       }
       throwIfAborted(signal);
       if (data.error || !data.b64) {
-        throw new Error(data.error || `生图请求失败 ${data.httpStatus ?? res.status}`);
+        throw imageRequestFailure(data.httpStatus ?? res.status, data.error);
       }
     } else {
       // 非流式回退(旧服务端等)
       data = await res.json().catch(() => ({})) as ServerImagePayload;
       throwIfAborted(signal);
       if (!res.ok || data.error || !data.b64) {
-        throw new Error(data.error || `生图请求失败 ${res.status}`);
+        throw imageRequestFailure(data.httpStatus ?? res.status, data.error);
       }
     }
     return { b64: data.b64, mimeType: data.mimeType, revisedPrompt: data.revisedPrompt };
+  } catch (error) {
+    throw imageResultUnknown(error, signal, controller.signal.aborted ? "生图请求已超时或连接中断（最长 180 秒）" : undefined);
   } finally {
     clearTimeout(totalTimer);
     if (signal) signal.removeEventListener("abort", onOuterAbort);
@@ -558,10 +545,10 @@ async function generateNovelAiDirect(params: {
   const totalTimer = setTimeout(() => controller.abort(), 180_000);
 
   try {
-    const res = await fetch(url, { method: "POST", headers, body, signal: controller.signal });
+    const res = await fetch(url, { method: "POST", headers, body, redirect: "error", signal: controller.signal });
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      throw new Error(`NovelAI 接口报错 ${res.status}: ${errText.slice(0, 200)}`);
+      throw imageRequestFailure(res.status, `NovelAI 接口报错 ${res.status}: ${errText.slice(0, 200)}`);
     }
 
     const arrayBuf = await res.arrayBuffer();
@@ -584,13 +571,7 @@ async function generateNovelAiDirect(params: {
     }
     return { b64: btoa(binary), mimeType: res.headers.get("content-type") || "image/png" };
   } catch (error) {
-    if (controller.signal.aborted && !signal?.aborted) {
-      throw new Error("NovelAI 直连请求超时（180 秒未返回）");
-    }
-    if (error instanceof TypeError) {
-      throw new Error("NovelAI 浏览器直连失败：可能受到浏览器跨域 (CORS) 限制，请在生图设置中将请求方式切换为「服务端转发」。");
-    }
-    throw error;
+    throw imageResultUnknown(error, signal, controller.signal.aborted ? "生图请求已超时或连接中断（最长 180 秒）" : undefined);
   } finally {
     clearTimeout(totalTimer);
     if (signal) signal.removeEventListener("abort", onOuterAbort);
@@ -615,6 +596,7 @@ async function generateNovelAiViaServer(params: {
     const resolution = getNovelAiResolution(preset.resolution);
     const res = await fetch("/api/image-generation", {
       method: "POST",
+      redirect: "error",
       headers: { "Content-Type": "application/json", "x-stream-heartbeat": "1" },
       signal: controller.signal,
       body: JSON.stringify({
@@ -636,6 +618,7 @@ async function generateNovelAiViaServer(params: {
     throwIfAborted(signal);
 
     type ServerImagePayload = { httpStatus?: number; b64?: string; mimeType?: string; revisedPrompt?: string; error?: string };
+    if (!res.ok) throw imageRequestFailure(res.status);
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
     let data: ServerImagePayload;
 
@@ -674,16 +657,18 @@ async function generateNovelAiViaServer(params: {
       }
       throwIfAborted(signal);
       if (data.error || !data.b64) {
-        throw new Error(data.error || `NovelAI 请求失败 ${data.httpStatus ?? res.status}`);
+        throw imageRequestFailure(data.httpStatus ?? res.status, data.error);
       }
     } else {
       data = await res.json().catch(() => ({})) as ServerImagePayload;
       throwIfAborted(signal);
       if (!res.ok || data.error || !data.b64) {
-        throw new Error(data.error || `NovelAI 请求失败 ${res.status}`);
+        throw imageRequestFailure(data.httpStatus ?? res.status, data.error);
       }
     }
     return { b64: data.b64, mimeType: data.mimeType, revisedPrompt: data.revisedPrompt };
+  } catch (error) {
+    throw imageResultUnknown(error, signal, controller.signal.aborted ? "生图请求已超时或连接中断（最长 180 秒）" : undefined);
   } finally {
     clearTimeout(totalTimer);
     if (signal) signal.removeEventListener("abort", onOuterAbort);

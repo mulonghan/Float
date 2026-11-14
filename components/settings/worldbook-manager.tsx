@@ -6,9 +6,9 @@ import {
     loadWorldBooks,
     saveWorldBooks,
     createWorldBook,
-    parseWorldBookFromJson,
+    importWorldBookFromJson,
+    parseWorldBookEntry,
     loadBindingConfig,
-    UNSUPPORTED_IMPORT_FORMAT,
 } from "@/lib/settings-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import type { WorldBookConfig, WorldBookEntry } from "@/lib/settings-types";
@@ -16,6 +16,8 @@ import { SettingsContext } from "../phone-settings-app";
 import { BottomSheet, ConfirmDialog, TextExpandModal } from "@/components/ui/modal";
 import { SwipeActionRow, useSwipeActions } from "@/components/ui/swipe-actions";
 import { notifyMascotPageContext } from "@/lib/mascot-events";
+import { worldBookOrderForDisplay, worldBookOrderFromDisplay } from "@/lib/worldbook-order";
+import { WorldBookDiagnosticsPanel } from "./worldbook-diagnostics-panel";
 
 export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {}) {
     const [books, setBooks] = useState<WorldBookConfig[]>([]);
@@ -27,6 +29,8 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
     const [expandUid, setExpandUid] = useState<string | null>(null);
     const [importError, setImportError] = useState<string | null>(null);
 
+    const [importWarnings, setImportWarnings] = useState<string[]>([]);
+    const [showDiagnostics, setShowDiagnostics] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const { setSubpageTitle, setOverrideBack, setSubpageRightAction } = useContext(SettingsContext);
@@ -286,31 +290,27 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
         }
     };
 
-    const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
+        e.target.value = "";
         if (!file) return;
+        setImportWarnings([]);
 
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            try {
-                const text = event.target?.result as string;
-                const parsed = parseWorldBookFromJson(text);
-                if (parsed) {
-                    persist([parsed, ...books]);
-                    setActiveBookId(parsed.id);
-                } else {
-                    setImportError("无法解析世界书文件，格式不正确。");
-                }
-            } catch (e) {
-                if (e instanceof Error && e.message === UNSUPPORTED_IMPORT_FORMAT) {
-                    setImportError("不支持该世界书格式");
-                } else {
-                    setImportError("无法解析世界书文件，格式不正确。");
-                }
-            }
-        };
-        reader.readAsText(file);
-        if (fileInputRef.current) fileInputRef.current.value = "";
+        let text: string;
+        try {
+            text = await file.text();
+        } catch {
+            setImportError("无法读取所选文件，请重新选择世界书 JSON。");
+            return;
+        }
+        try {
+            const { book, warnings } = await importWorldBookFromJson(text);
+            setBooks(loadWorldBooks());
+            setActiveBookId(book.id);
+            setImportWarnings(warnings);
+        } catch (error) {
+            setImportError(error instanceof Error ? error.message : "无法导入世界书。");
+        }
     };
 
     const handleExport = async (book: WorldBookConfig) => {
@@ -372,39 +372,19 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
     const entryFileInputRef = useRef<HTMLInputElement>(null);
     const entryImportModeRef = useRef<{ mode: "append" } | { mode: "replace"; uid: string } | null>(null);
 
-    const sanitizeEntryImport = (raw: unknown, fallbackUid: string): WorldBookEntry | null => {
-        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-        const obj = raw as Record<string, unknown>;
-        if (typeof obj.content !== "string" && typeof obj.comment !== "string" && typeof obj.key !== "string" && !Array.isArray(obj.key)) return null;
-        // 兼容酒馆世界书条目：key 可能是字符串数组
-        const key = Array.isArray(obj.key)
-            ? obj.key.filter((k): k is string => typeof k === "string").join(", ")
-            : (typeof obj.key === "string" ? obj.key : "");
-        return {
-            uid: fallbackUid,
-            key,
-            content: typeof obj.content === "string" ? obj.content : "",
-            comment: typeof obj.comment === "string" ? obj.comment : "",
-            use_regex: !!obj.use_regex,
-            disable: !!obj.disable,
-            constant: !!obj.constant,
-            position: typeof obj.position === "number" || typeof obj.position === "string"
-                ? obj.position as WorldBookEntry["position"]
-                : 4,
-            depth: typeof obj.depth === "number" ? obj.depth : 4,
-            probability: typeof obj.probability === "number" ? obj.probability : 100,
-            useProbability: !!obj.useProbability,
-            role: typeof obj.role === "number" ? obj.role : 0,
-            insertion_order: typeof obj.insertion_order === "number" ? obj.insertion_order : 50,
-        };
-    };
-
     const appendImportedEntries = (book: WorldBookConfig, raws: unknown[]) => {
-        const base = Date.now();
-        const appended = raws
-            .map((raw, i) => sanitizeEntryImport(raw, `wb-entry-${base + i}`))
-            .filter((entry): entry is WorldBookEntry => !!entry);
-        if (appended.length === 0) {
+        const appended: WorldBookEntry[] = [];
+        const ids = new Set(book.entries.map(entry => entry.uid));
+        for (const raw of raws) {
+            const entry = parseWorldBookEntry(raw);
+            if (!entry || ids.has(entry.uid)) {
+                setImportError("条目格式不正确，或条目 ID 已存在。替换现有条目请使用「替换」。");
+                return;
+            }
+            ids.add(entry.uid);
+            appended.push(entry);
+        }
+        if (!appended.length) {
             setImportError("JSON 里没有可识别的条目内容。");
             return;
         }
@@ -418,14 +398,12 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
     };
 
     const replaceImportedEntry = (book: WorldBookConfig, targetUid: string, raw: unknown) => {
-        const sanitized = sanitizeEntryImport(raw, targetUid);
+        const sanitized = parseWorldBookEntry(raw, { replaceUid: targetUid });
         if (!sanitized) {
             setImportError("JSON 里没有可识别的条目内容。");
             return;
         }
-        // 保留原 uid，只替换内容
-        const finalEntry = { ...sanitized, uid: targetUid };
-        updateBook(book.id, { entries: (book.entries || []).map(e => e.uid === targetUid ? finalEntry : e) });
+        updateBook(book.id, { entries: book.entries.map(e => e.uid === targetUid ? sanitized : e) });
     };
 
     const exportEntry = async (entry: WorldBookEntry) => {
@@ -474,6 +452,16 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
         <div ref={wbContainerRef} className="flex flex-col gap-5 h-full">
             <input type="file" accept=".json" className="hidden" ref={fileInputRef} onChange={handleImport} />
             <input type="file" accept=".json" className="hidden" ref={entryFileInputRef} onChange={handleEntryImportFile} />
+            <div>
+                <button type="button" className="ui-btn ui-btn-outline" onClick={() => setShowDiagnostics(true)}>
+                    检查世界书注入
+                </button>
+            </div>
+            {showDiagnostics && (
+                <BottomSheet title="检查世界书注入" onClose={() => setShowDiagnostics(false)}>
+                    <WorldBookDiagnosticsPanel selectedBookId={viewMode === "detail" ? activeBookId : undefined} />
+                </BottomSheet>
+            )}
             {viewMode === "list" ? (
                 <>
                     <div className="flex items-center">
@@ -680,8 +668,8 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                                     {entry.key || "(无触发词)"}
                                                                 </span>
                                                                 {entry.constant && <span className="ui-status-tag" data-variant="warning">常驻激活</span>}
-                                                                {entry.use_regex && !entry.constant && <span className="ui-status-tag" data-variant="action">正则触发</span>}
-                                                                {!entry.constant && !entry.use_regex && <span className="ui-status-tag" data-variant="success">关键词触发</span>}
+                                                                {entry.key.trim() && entry.use_regex && !entry.constant && <span className="ui-status-tag" data-variant="action">正则触发</span>}
+                                                                {entry.key.trim() && !entry.constant && !entry.use_regex && <span className="ui-status-tag" data-variant="success">关键词触发</span>}
                                                                 {entry.disable && <span className="ui-status-tag">已禁用</span>}
                                                             </div>
                                                         </div>
@@ -767,19 +755,39 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                             </div>
 
                                                             <div className="flex flex-col gap-1">
-                                                                <label className="menu-desc">权重优先级 (Order)</label>
+                                                                <label className="menu-desc" htmlFor={`wb-order-${entry.uid}`}>
+                                                                    {entry.orderSource === "lorebook" ? "Lorebook 优先级" : "Float 排序值"}
+                                                                </label>
                                                                 <input
+                                                                    id={`wb-order-${entry.uid}`}
+                                                                    key={entry.insertion_order}
                                                                     type="number"
-                                                                    value={entry.insertion_order ?? 50}
-                                                                    onChange={(e) => updateEntry(entry.uid, { insertion_order: parseInt(e.target.value) || 0 })}
+                                                                    step="any"
+                                                                    defaultValue={worldBookOrderForDisplay(entry)}
+                                                                    onBlur={(e) => {
+                                                                        const value = e.currentTarget.valueAsNumber;
+                                                                        if (!Number.isFinite(value)) {
+                                                                            e.currentTarget.value = String(worldBookOrderForDisplay(entry));
+                                                                            return;
+                                                                        }
+                                                                        if (value !== worldBookOrderForDisplay(entry)) {
+                                                                            updateEntry(entry.uid, { insertion_order: worldBookOrderFromDisplay(entry, value) });
+                                                                        }
+                                                                    }}
                                                                     className="ui-input ts-13"
                                                                 />
+                                                                <span className="menu-desc">
+                                                                    {entry.orderSource === "lorebook"
+                                                                        ? `优先级越大越靠前。同组混排使用 Float 排序值 ${entry.insertion_order}。`
+                                                                        : "同组内数值越小越靠前。未标记来源的旧条目沿用此值。"}
+                                                                </span>
                                                             </div>
                                                             <div className="flex flex-col gap-1">
                                                                 <label className="menu-desc">消息角色 (Role)</label>
                                                                 <select
                                                                     value={entry.role ?? 0}
                                                                     onChange={(e) => updateEntry(entry.uid, { role: parseInt(e.target.value) || 0 })}
+                                                                    disabled={entry.position !== 4}
                                                                     className="ui-select ts-13"
                                                                 >
                                                                     <option value={0}>System</option>
@@ -787,6 +795,9 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                                     <option value={2}>Assistant</option>
                                                                 </select>
                                                             </div>
+                                                            {entry.position !== 4 && (
+                                                                <p className="menu-desc col-span-full">在此位置以 System 注入。已保存的角色和深度将在切换到「按深度插入」后生效。</p>
+                                                            )}
                                                             <div className="col-span-full flex items-center gap-3">
                                                                 <span className="menu-desc !mt-0 shrink-0">触发概率 (Probability)</span>
                                                                 <label className="ui-checkbox-label whitespace-nowrap">
@@ -806,12 +817,12 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                         </div>
 
                                                         <div className="flex flex-col gap-1">
-                                                            <label className="menu-desc">备注 (Comment)</label>
+                                                            <label className="menu-desc">条目名称</label>
                                                             <input
                                                                 type="text"
                                                                 value={entry.comment}
                                                                 onChange={(e) => updateEntry(entry.uid, { comment: e.target.value })}
-                                                                placeholder="描述设定的作用..."
+                                                                placeholder="输入条目名称"
                                                                 className="ui-input ts-13"
                                                             />
                                                         </div>
@@ -871,6 +882,18 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                         setConfirmDeleteTarget(null);
                     }}
                     onCancel={() => setConfirmDeleteTarget(null)}
+                />
+            )}
+
+            {!!importWarnings.length && !importError && (
+                <ConfirmDialog
+                    title="世界书已导入，有兼容性提示"
+                    message={importWarnings.join("\n")}
+                    icon={AlertCircle}
+                    confirmLabel="知道了"
+                    cancelLabel=""
+                    onConfirm={() => setImportWarnings([])}
+                    onCancel={() => setImportWarnings([])}
                 />
             )}
 

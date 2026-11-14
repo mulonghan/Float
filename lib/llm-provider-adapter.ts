@@ -2,6 +2,7 @@ import type { LLMContentPart, LLMMessage } from "./llm-prompt-assembler";
 import type { ApiConfig, PresetConfig } from "./settings-types";
 import {
     buildChatCompletionsUrl,
+    buildAnthropicMessagesUrl,
     buildRequestHeaders,
     determineBaseUrl,
     isNativeAnthropicApi,
@@ -591,7 +592,7 @@ function buildAnthropicRequest(
         }));
     }
     return {
-        url: `${baseUrl.replace(/\/$/, "")}/messages`,
+        url: buildAnthropicMessagesUrl(baseUrl),
         headers: buildRequestHeaders(config, baseUrl),
         body,
         providerKind: "anthropic",

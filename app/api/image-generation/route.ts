@@ -248,7 +248,7 @@ async function runNovelAiGeneration(input: ImageGenerationRequest): Promise<{ st
     const timeout = setTimeout(() => controller.abort(), 120_000);
     let res: Response;
     try {
-      res = await externalFetch(url, { method: "POST", headers, body, signal: controller.signal });
+      res = await externalFetch(url, { method: "POST", headers, body, redirect: "error", signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
@@ -336,7 +336,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const timeout = setTimeout(() => controller.abort(), 120_000);
     let res: Response;
     try {
-      res = await externalFetch(url, { method: "POST", headers, body, signal: controller.signal });
+      res = await externalFetch(url, { method: "POST", headers, body, redirect: "error", signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }

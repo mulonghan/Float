@@ -1,3 +1,4 @@
+import { recordWorldBookReport, WorldBookTrace } from "./worldbook-diagnostics";
 // lib/chat-engine.ts
 
 import { createSseJsonParser } from "./sse-json";
@@ -54,7 +55,7 @@ import {
 } from "./llm-provider-adapter";
 import { setDebugPromptSnapshot, type DebugPromptSnapshot } from "./debug-store";
 import { extractFinishReason } from "./api-helpers";
-import { fetchLlmPayload } from "./llm-http";
+import { assertLlmHttpResponse, assertLlmStreamChunk, describeLlmFailure, fetchLlmPayload, LlmHttpError, readLlmJson } from "./llm-http";
 import { loadMemoryConfig, incrementEventCounter } from "./memory-storage";
 import { retrieveCoreMemoriesForPrompt, retrieveMemoriesForPrompt } from "./memory-service";
 import { formatCoreMemories, formatLongTermMemories } from "./memory-injector";
@@ -347,6 +348,7 @@ export type DebugPromptRequestOptions = {
 };
 
 type ChatPromptBuildOptions = {
+    recordWorldBooks?: boolean;
     followUpCount?: number;
     followUpDelay?: number;
     timedWakeElapsedMinutes?: number;
@@ -714,9 +716,20 @@ function emptyResponseDetails(data: unknown): {
     return { finishReason, blockReason, safetyRatings, message };
 }
 
+function logLlmHttpFailure(error: LlmHttpError, options?: Parameters<typeof apiLogChannelFor>[0]): void {
+    pushApiLog({
+        ...apiLogChannelFor(options),
+        messages: [],
+        rawResponse: "",
+        httpStatus: error.status,
+        failureKind: error.kind,
+    });
+}
+
 async function readSseStream(
     response: Response,
     providerKind: ChatCompletionStreamResult["providerKind"],
+    apiKey: string,
     callbacks?: ChatCompletionStreamCallbacks,
     stripTimestamps = true,
 ): Promise<{ content: string; rawResponse: string }> {
@@ -736,6 +749,7 @@ async function readSseStream(
     // 容错解析：中转把长 JSON 行切开时做碎片重组，不再静默丢增量（见 sse-json.ts）
     const sseParser = createSseJsonParser();
     const handleParsed = async (parsed: unknown) => {
+        assertLlmStreamChunk(parsed, apiKey);
         const parts = parseProviderStreamDelta(providerKind, parsed);
         if (parts.reasoning) {
             await callbacks?.onReasoningDelta?.(parts.reasoning);
@@ -820,10 +834,7 @@ export async function sendLLMStreamRequest(
 
     try {
         const response = await fetchLlmPayload(request, { signal: llmAbort.signal });
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new ChatEngineError(`API Stream Error ${response.status}: ${errorText}`);
-        }
+        await assertLlmHttpResponse(response, request.url, config.apiKey);
         // 流式路径收集思维链原文：readSseStream 只通过 onReasoningDelta 回调透传，
         // 不额外包一层的话日志里就只有清洗后的回复正文，思维链被吞。
         // 注意：必须无条件创建回调对象（不能 callbacks 为空就不传），否则思维链收集不到。
@@ -835,7 +846,7 @@ export async function sendLLMStreamRequest(
                 await (pluginCallbacks ?? callbacks)?.onReasoningDelta?.(text);
             },
         };
-        const { content: streamedContent, rawResponse } = await readSseStream(response, request.providerKind, streamLogCallbacks, !options?.skipTimestampStrip);
+        const { content: streamedContent, rawResponse } = await readSseStream(response, request.providerKind, config.apiKey, streamLogCallbacks, !options?.skipTimestampStrip);
         if (!streamedContent.trim()) {
             throw new ChatEngineError("流式响应没有解析到文本增量。");
         }
@@ -875,8 +886,12 @@ export async function sendLLMStreamRequest(
             if (options?.signal?.aborted) throw error;
             throw new ChatEngineError("AI 流式回复超时（500秒），请重试。");
         }
+        if (error instanceof LlmHttpError) {
+            logLlmHttpFailure(error, options);
+            throw error;
+        }
         if (error instanceof ChatEngineError) throw error;
-        const detail = error instanceof Error ? error.message : String(error);
+        const detail = describeLlmFailure(error, config.apiKey, options?.signal);
         throw new ChatEngineError(`Stream Network Error connecting to AI Provider: ${detail}`);
     } finally {
         clearTimeout(llmTimeout);
@@ -919,8 +934,8 @@ export async function sendLLMRequestPreferStream(
         }
         return result.content;
     } catch (error) {
-        if (received || options?.signal?.aborted) throw error;
-        console.warn("[ChatEngine] 流式请求没有收到内容，退回非流式重试：", error);
+        if (received || options?.signal?.aborted || error instanceof LlmHttpError && error.kind !== "format") throw error;
+        console.warn("[ChatEngine] 流式请求没有收到内容，退回非流式重试。");
         return sendLLMRequest(config, preset, messages, regexes, meta, options);
     }
 }
@@ -976,7 +991,7 @@ export async function sendLLMRequest(
     };
 
     console.log("[ChatEngine] Message roles:", request.messagesForLog.map((m, i) => `${i}:${m.role}`).join(" → "));
-    console.log("[ChatEngine] Request:", requestDebugInfo);
+    console.log("[ChatEngine] Request:", { messageCount: requestDebugInfo.messageCount, bodySize: requestDebugInfo.bodySize });
 
     const llmAbort = new AbortController();
     const llmTimeout = setTimeout(() => llmAbort.abort(), 500_000);
@@ -985,12 +1000,9 @@ export async function sendLLMRequest(
     try {
         const response = await fetchLlmPayload(request, { signal: llmAbort.signal });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new ChatEngineError(`API Error ${response.status}: ${errorText}`);
-        }
+        await assertLlmHttpResponse(response, request.url, config.apiKey);
 
-        const data = await response.json();
+        const data = await readLlmJson(response, request.url, config.apiKey);
         const parsed = parseProviderResponse(request.providerKind, data);
         let rawOutput = parsed.content || "";
 
@@ -1013,10 +1025,6 @@ export async function sendLLMRequest(
             console.warn("[ChatEngine] Empty response from API!", {
                 provider: config.provider,
                 model: config.defaultModel,
-                finishReason: emptyDetails.finishReason,
-                blockReason: emptyDetails.blockReason,
-                safetyRatings: emptyDetails.safetyRatings,
-                fullData: JSON.stringify(data).slice(0, 1000),
             });
             throw new ChatEngineError(emptyDetails.message);
         }
@@ -1049,10 +1057,15 @@ export async function sendLLMRequest(
         return applyOutputRegex(rawOutput, regexes, { macroEngine, activeTags });
     } catch (error: unknown) {
         if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
+            if (options?.signal?.aborted) throw error;
             throw new ChatEngineError("AI 回复超时（500秒），请重试。");
         }
+        if (error instanceof LlmHttpError) {
+            logLlmHttpFailure(error, options);
+            throw error;
+        }
         if (error instanceof ChatEngineError) throw error;
-        const detail = error instanceof Error ? error.message : String(error);
+        const detail = describeLlmFailure(error, config.apiKey, options?.signal);
         throw new ChatEngineError(
             `Network Error connecting to AI Provider: ${detail}\n请求诊断：provider=${requestDebugInfo.provider}, model=${requestDebugInfo.model}, app=${requestDebugInfo.appId}, messages=${requestDebugInfo.messageCount}, bodySize=${requestDebugInfo.bodySize}, estimatedTokens=${requestDebugInfo.bodyTokenEstimate}, largestMessage=${requestDebugInfo.largestMessageSize}, largestRole=${requestDebugInfo.largestMessageRole}, largestIndex=${requestDebugInfo.largestMessageIndex}`,
         );
@@ -1161,10 +1174,7 @@ export async function sendLLMToolStreamRequest(
     try {
         const response = await fetchLlmPayload(request, { signal: llmAbort.signal });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new ChatEngineError(`API Tool Stream Error ${response.status}: ${errorText}`);
-        }
+        await assertLlmHttpResponse(response, request.url, config.apiKey);
         if (!response.body) throw new ChatEngineError("原生动作流式响应没有 body。");
 
         const reader = response.body.getReader();
@@ -1174,6 +1184,7 @@ export async function sendLLMToolStreamRequest(
         // 不再因单行 JSON Parse error 杀掉整条流（写 APP 大参数时高发）
         const sseParser = createSseJsonParser();
         const handleParsedDelta = async (data: unknown) => {
+            assertLlmStreamChunk(data, config.apiKey);
             {
                     const delta = parseProviderStreamDelta(request.providerKind, data);
                     if (delta.reasoning) {
@@ -1271,8 +1282,12 @@ export async function sendLLMToolStreamRequest(
             if (options?.signal?.aborted) throw error;
             throw new ChatEngineError("AI 原生动作流式回复超时（500秒），请重试。");
         }
+        if (error instanceof LlmHttpError) {
+            logLlmHttpFailure(error, options);
+            throw error;
+        }
         if (error instanceof ChatEngineError) throw error;
-        const detail = error instanceof Error ? error.message : String(error);
+        const detail = describeLlmFailure(error, config.apiKey, options?.signal);
         throw new ChatEngineError(`Tool Stream Network Error connecting to AI Provider: ${detail}`);
     } finally {
         clearTimeout(llmTimeout);
@@ -1309,12 +1324,9 @@ export async function sendLLMToolRequest(
     try {
         const response = await fetchLlmPayload(request, { signal: llmAbort.signal });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new ChatEngineError(`API Tool Error ${response.status}: ${errorText}`);
-        }
+        await assertLlmHttpResponse(response, request.url, config.apiKey);
 
-        const data = await response.json();
+        const data = await readLlmJson(response, request.url, config.apiKey);
         const parsed = parseProviderResponse(request.providerKind, data);
         let rawOutput = parsed.content || "";
         if (options?.includeReasoning && parsed.reasoning) {
@@ -1327,10 +1339,6 @@ export async function sendLLMToolRequest(
             console.warn("[ChatEngine] Empty native tool response from API!", {
                 provider: config.provider,
                 model: config.defaultModel,
-                finishReason: emptyDetails.finishReason,
-                blockReason: emptyDetails.blockReason,
-                safetyRatings: emptyDetails.safetyRatings,
-                fullData: JSON.stringify(data).slice(0, 1000),
             });
             throw new ChatEngineError(emptyDetails.message);
         }
@@ -1378,8 +1386,12 @@ export async function sendLLMToolRequest(
             if (options?.signal?.aborted) throw error;
             throw new ChatEngineError("AI 原生动作回复超时（500秒），请重试。");
         }
+        if (error instanceof LlmHttpError) {
+            logLlmHttpFailure(error, options);
+            throw error;
+        }
         if (error instanceof ChatEngineError) throw error;
-        const detail = error instanceof Error ? error.message : String(error);
+        const detail = describeLlmFailure(error, config.apiKey, options?.signal);
         throw new ChatEngineError(`Tool Network Error connecting to AI Provider: ${detail}`);
     } finally {
         clearTimeout(llmTimeout);
@@ -1939,7 +1951,11 @@ export async function buildChatPromptMessages(
         )
         : "";
 
+    const worldBookTrace = options?.recordWorldBooks && typeof window !== "undefined"
+        ? new WorldBookTrace(session.id, character.name, preset, isOfflineMode ? "线下单聊" : "单聊", worldBookIds, allWorldBooks.filter(book => worldBookIds.includes(book.id)), promptProfile?.enableWorldBooks === false)
+        : undefined;
     const llmMessages = assemblePromptPayload({
+        worldBookTrace,
         character,
         history: promptHistory,
         preset,
@@ -1995,6 +2011,7 @@ export async function buildChatPromptMessages(
     }
     appendEmptyGenerateGuardMessage(llmMessages, config, historyForPrompt);
 
+    recordWorldBookReport(worldBookTrace);
     return { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled };
 }
 
@@ -2055,6 +2072,7 @@ export async function generateOfflineChatCompletion(
         {
             appTags: ["chat", "offline"],
             excludeOfflineSessionId: session.id,
+            recordWorldBooks: true,
         },
     );
     const summaryTag = preset?.story_summary_tag?.trim() || "summary";
@@ -2560,7 +2578,7 @@ async function generateChatCompletionCore(
     callbacks: ChatCompletionCallbacks | undefined,
     bailoutRef: ReplyBailoutRef,
 ): Promise<ChatCompletionResult> {
-    const { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled } = await buildChatPromptMessages(session, history, options);
+    const { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled } = await buildChatPromptMessages(session, history, { ...options, recordWorldBooks: (options?.appId ?? "chat") === "chat" });
     const requestAppTags = mergeAppTags(options?.appTags, options?.promptProfile?.appTags, options?.appId ?? "chat");
 
     // 追问有自己的排期时兜底（followup:key），这里只为普通回复生成挂单。

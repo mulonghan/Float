@@ -9,7 +9,8 @@ import { generateEmbedding, isEmbeddingModelName } from "@/lib/memory-embedding"
 import { ConfirmDialog } from "@/components/ui/modal";
 import { Toggle, Input } from "@/components/ui/form";
 import { Alert } from "@/components/ui/feedback";
-import { determineBaseUrl, simpleLLMCall } from "@/lib/api-helpers";
+import { assertLlmHttpResponse, describeLlmFailure, readLlmJson } from "@/lib/llm-http";
+import { buildAnthropicMessagesUrl, buildRequestHeaders, determineBaseUrl, isNativeAnthropicApi, simpleLLMCall } from "@/lib/api-helpers";
 
 const DEFAULT_CONFIGS: ApiConfig[] = [
     {
@@ -26,7 +27,7 @@ const DEFAULT_CONFIGS: ApiConfig[] = [
 ];
 
 function getNativeToolProtocolLabel(config: ApiConfig): string {
-    if (config.provider === "Anthropic" && !config.baseUrl) return "Anthropic";
+    if (isNativeAnthropicApi(config)) return "Anthropic";
     if (config.provider === "Google") return "Gemini";
     return "OpenAI-compatible";
 }
@@ -124,24 +125,20 @@ export function ApiSettings() {
             const isGoogleNative = config.provider === "Google";
             // 用户常把完整端点填进 Base URL（如 .../v1/embeddings、.../v1/chat/completions），
             // 拼 /models 前剥掉这类端点后缀；已以 /models 结尾则原样使用。
-            const modelsBase = baseUrl
+            const modelsBase = (isNativeAnthropicApi(config) ? buildAnthropicMessagesUrl(baseUrl) : baseUrl)
                 .replace(/\/$/, "")
                 .replace(/\/(chat\/completions|completions|embeddings|messages)$/i, "");
             const modelsUrl = /\/models$/i.test(modelsBase) ? modelsBase : `${modelsBase}/models`;
             const url = isGoogleNative
                 ? `${modelsUrl}?key=${encodeURIComponent(config.apiKey)}`
                 : modelsUrl;
-            const headers: Record<string, string> = { "Content-Type": "application/json" };
-            if (!isGoogleNative) headers["Authorization"] = `Bearer ${config.apiKey}`;
+            const headers = buildRequestHeaders(config, baseUrl);
+            if (isGoogleNative) delete headers.Authorization;
 
             const response = await fetch(url, { method: "GET", headers });
 
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.error?.message || `HTTP error! status: ${response.status}`);
-            }
-
-            const data = await response.json();
+            await assertLlmHttpResponse(response, modelsUrl, config.apiKey);
+            const data = await readLlmJson(response, modelsUrl, config.apiKey);
             let modelNames: string[] = [];
             if (isGoogleNative && Array.isArray(data?.models)) {
                 // Gemini 原生：name 可能是 "models/gemini-2.5-pro" 或纯名字
@@ -154,7 +151,7 @@ export function ApiSettings() {
             setFetchedModels(prev => ({ ...prev, [config.id]: modelNames }));
             setTestResult(prev => ({ ...prev, [config.id]: { success: true, message: `成功获取 ${modelNames.length} 个模型` } }));
         } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
+            const msg = describeLlmFailure(error, config.apiKey);
             setTestResult(prev => ({ ...prev, [config.id]: { success: false, message: `拉取失败: ${msg}` } }));
             setFetchedModels(prev => ({ ...prev, [config.id]: [] }));
         } finally {

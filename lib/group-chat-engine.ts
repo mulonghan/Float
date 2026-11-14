@@ -1,3 +1,4 @@
+import { recordWorldBookReport, WorldBookTrace } from "./worldbook-diagnostics";
 // lib/group-chat-engine.ts
 // Group chat engine: single API call for all characters.
 
@@ -281,6 +282,7 @@ function scheduleGroupMemorySummarization(
  * Shared prompt builder for group chat — used by both generate and preview.
  */
 export type GroupChatPromptBuildOptions = {
+    recordWorldBooks?: boolean;
     appTags?: string[];
     excludeOfflineSessionId?: string;
     disableTools?: boolean;
@@ -334,6 +336,7 @@ async function buildGroupChatPromptMessages(
 
     const now = new Date();
     const memberTimeContexts: Record<string, ReturnType<typeof buildCharacterTimeContext>> = {};
+    const boundIds = new Set<string>();
     const memberDataPromises = participantIds.map(async (charId): Promise<GroupMemberData | null> => {
         const character = charMap.get(charId);
         if (!character) return null;
@@ -342,6 +345,7 @@ async function buildGroupChatPromptMessages(
         const scheduleSummary = buildCalendarScheduleMarker("character", charId, getWeekStartIso(now));
         const currentSchedule = getCurrentCalendarScheduleForPrompt("character", charId, now);
         const charSlot = resolveBinding(bindings, charId, "group_chat");
+        if (options?.recordWorldBooks) for (const id of charSlot.worldBookIds ?? []) boundIds.add(id);
         const worldBooks = promptProfile?.enableWorldBooks === false
             ? []
             : (charSlot.worldBookIds || []).map(id => allWorldBooks.find(w => w.id === id)).filter(Boolean) as typeof allWorldBooks;
@@ -457,7 +461,11 @@ async function buildGroupChatPromptMessages(
         userName,
     );
 
+    const worldBookTrace = options?.recordWorldBooks && typeof window !== "undefined"
+        ? new WorldBookTrace(session.id, memberNames.join("、"), preset, isOfflineMode ? "线下群聊" : "群聊", [...boundIds], allWorldBooks.filter(book => boundIds.has(book.id)), promptProfile?.enableWorldBooks === false)
+        : undefined;
     const llmMessages = assembleGroupPromptPayload({
+        worldBookTrace,
         members,
         history: promptHistory,
         preset,
@@ -506,6 +514,7 @@ async function buildGroupChatPromptMessages(
     }
     appendEmptyGenerateGuardMessage(llmMessages, config, history);
 
+    recordWorldBookReport(worldBookTrace);
     return { llmMessages, config, preset, regexes, nameToId, memberNames, enabledTools, userName, appTags: activeAppTags };
 }
 
@@ -804,6 +813,7 @@ export async function generateGroupChatCompletion(
         disableTools: options?.disableTools,
         promptProfile: options?.promptProfile,
         apiConfigId: options?.apiConfigId,
+        recordWorldBooks: true,
     });
     const chars = loadCharacters();
     const participantIds = session.participantIds || [];

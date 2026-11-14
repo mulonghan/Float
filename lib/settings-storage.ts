@@ -35,7 +35,7 @@ import { areTagsEqual, normalizePromptScopeTags, normalizeTags } from "./content
 import {
     readPresetsCache, writePresetsCache,
     writePresetsCacheAsync,
-    readWorldBooksCache, writeWorldBooksCache,
+    readWorldBooksCache, writeWorldBooksCache, insertWorldBook,
     readRegexesCache, writeRegexesCache,
     hydrateSettingsDb,
 } from "./settings-db";
@@ -64,18 +64,6 @@ function isUnsupportedPresetFormat(obj: Record<string, unknown>): boolean {
 /** World book shapes with unsupported root/entry fields. */
 const UNSUPPORTED_WB_ROOT_FIELDS = ["recursiveScan", "caseSensitive", "originalData", "globalSelect"];
 const UNSUPPORTED_WB_ENTRY_FIELDS = ["selectiveLogic", "secondary_keys", "extensions", "characterFilter", "vectorized"];
-
-function isUnsupportedWorldBookFormat(obj: Record<string, unknown>): boolean {
-    // Root-level external fields
-    if (UNSUPPORTED_WB_ROOT_FIELDS.some(f => f in obj)) return true;
-    // Dictionary entries are treated as unsupported import format
-    if (obj.entries && typeof obj.entries === "object" && !Array.isArray(obj.entries)) return true;
-    // Check entry-level external fields
-    const entries = Array.isArray(obj.entries) ? obj.entries : (obj.entries && typeof obj.entries === "object" ? Object.values(obj.entries) : []);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (entries.length > 0 && entries.some((e: any) => e && UNSUPPORTED_WB_ENTRY_FIELDS.some(f => f in e))) return true;
-    return false;
-}
 
 // --- Keys ---
 const API_CONFIGS_KEY = "ai_phone_api_configs_v1";
@@ -178,7 +166,7 @@ function preserveCustomAppPresetPrompts(fresh: PresetConfig, previous: PresetCon
 
 // --- Presets ──────────────────────────────────────────
 
-export function loadPresets(): PresetConfig[] {
+export function loadPresets({ persist = true }: { persist?: boolean } = {}): PresetConfig[] {
     if (typeof window === "undefined") return [];
     try {
         const cachedPresets = readPresetsCache();
@@ -190,16 +178,16 @@ export function loadPresets(): PresetConfig[] {
         if (!existingBuiltin) {
             const builtin = createBuiltinPreset();
             presets.unshift(builtin);
-            savePresets(presets);
+            if (persist) savePresets(presets);
             shouldPersistCleanup = false;
         } else if ((existingBuiltin.builtInVersion ?? 0) < BUILTIN_PRESET_VERSION) {
             const fresh = preserveCustomAppPresetPrompts(createBuiltinPreset(), existingBuiltin);
             fresh.id = existingBuiltin.id;
             const idx = presets.indexOf(existingBuiltin);
             presets[idx] = fresh;
-            savePresets(presets);
+            if (persist) savePresets(presets);
             shouldPersistCleanup = false;
-        } else if (shouldPersistCleanup) {
+        } else if (persist && shouldPersistCleanup) {
             savePresets(presets);
         }
 
@@ -431,59 +419,244 @@ export function createWorldBook(name: string): WorldBookConfig {
     };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseWorldBookEntry(e: any): WorldBookEntry {
-    // Resolve key: support arrays, strings, and fallback field names
-    let key = "";
-    if (Array.isArray(e.key)) {
-        key = e.key.join(",");
-    } else {
-        key = String(e.key ?? e.keysecondary ?? e.keyword ?? e.keys?.join(",") ?? "");
+function worldBookRecord(raw: unknown): Record<string, unknown> | null {
+    return raw !== null && typeof raw === "object" && !Array.isArray(raw)
+        ? raw as Record<string, unknown>
+        : null;
+}
+
+function worldBookId(value: unknown): string | undefined {
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    if (typeof value === "string" && value.trim()) return value;
+}
+
+function worldBookNumber(value: unknown, fallback: number): number {
+    if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+}
+
+export function parseWorldBookEntry(raw: unknown, options: { fallbackUid?: string; replaceUid?: string } = {}): WorldBookEntry | null {
+    const entry = worldBookRecord(raw);
+    if (!entry) return null;
+    if (UNSUPPORTED_WB_ENTRY_FIELDS.some(field => field in entry)) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
+
+    const keywords = entry.key ?? entry.keywords ?? entry.keys ?? entry.keyword ?? entry.keysecondary;
+    const title = entry.comment ?? entry.name;
+    if ((entry.content !== undefined && typeof entry.content !== "string")
+        || (typeof entry.content !== "string" && typeof title !== "string" && typeof keywords !== "string" && !Array.isArray(keywords))) {
+        return null;
     }
-    // Merge disable/disabled/enabled: entry is disabled if disable=true OR enabled=false
-    const isDisabled = Boolean(e.disable || e.disabled || false) || (e.enabled === false);
+    const key = Array.isArray(keywords)
+        ? keywords.filter((word): word is string => typeof word === "string").join(",")
+        : typeof keywords === "string" ? keywords : "";
+    const position = entry.position;
+    const legacyPosition = position === "before_char" || position === "after_char"
+        || position === "before_an" || position === "after_an"
+        || position === "before_em" || position === "after_em";
+    const role = entry.role === "user" ? 1 : entry.role === "assistant" ? 2 : worldBookNumber(entry.role, 0);
+
     return {
-        uid: e.uid ? String(e.uid) : String(e.id || generateId("wb-entry")),
+        uid: options.replaceUid ?? worldBookId(entry.uid) ?? worldBookId(entry.id) ?? options.fallbackUid ?? generateId("wb-entry"),
         key,
-        content: String(e.content ?? ""),
-        comment: String(e.comment ?? ""),
-        use_regex: Boolean(e.use_regex || e.isRegex || false),
-        disable: isDisabled,
-        constant: Boolean(e.constant || false),
-        position: e.position !== undefined ? (typeof e.position === "string" && /^\d+$/.test(e.position) ? Number(e.position) : e.position) : "before_char",
-        depth: Number(e.depth) || 0,
-        probability: Number(e.probability) || 100,
-        useProbability: Boolean(e.useProbability || false),
-        role: Number(e.role) || 0,
-        insertion_order: Number(e.order ?? e.insertion_order ?? 50),
+        content: typeof entry.content === "string" ? entry.content : "",
+        comment: typeof title === "string" ? title : "",
+        use_regex: (entry.use_regex ?? entry.isRegex) === true,
+        disable: entry.disable === true || entry.disabled === true || entry.enabled === false,
+        constant: (entry.constant ?? entry.constantActive) === true,
+        position: legacyPosition ? position : worldBookNumber(position, 0),
+        depth: worldBookNumber(entry.depth, 0),
+        probability: worldBookNumber(entry.probability, 100),
+        useProbability: typeof entry.useProbability === "boolean" ? entry.useProbability : entry.probability != null,
+        role,
+        insertion_order: worldBookNumber(entry.insertion_order ?? entry.order, 50),
+        ...(entry.orderSource === "lorebook" ? { orderSource: "lorebook" as const } : {}),
+    };
+}
+
+class WorldBookImportError extends Error {
+    constructor(message: string, readonly unsupported = false) {
+        super(message);
+    }
+}
+
+const LOREBOOK_FIELDS = new Set(["id", "name", "description", "enabled", "entries", "createdAt", "updatedAt"]);
+const LOREBOOK_ENTRY_FIELDS = new Set([
+    "id", "name", "content", "enabled", "priority", "position", "injectDepth",
+    "role", "keywords", "useRegex", "constantActive", "caseSensitive", "scanDepth", "sticky", "cooldown", "delay",
+]);
+const LOREBOOK_POSITIONS = ["before_system_prompt", "after_system_prompt", "at_depth", "bottom_of_chat", "top_of_chat"] as const;
+const LOREBOOK_ROLES = ["system", "user", "assistant"] as const;
+
+// Exporters use both uppercase enum names and lowercase serialized values.
+function normalizeLorebookEnum(value: unknown): string | undefined {
+    return typeof value === "string" ? value.toLowerCase() : undefined;
+}
+
+function readLorebookEnum<T extends string>(
+    entry: Record<string, unknown>, field: "position" | "role", fallback: T, allowed: readonly T[], prefix: string,
+): T {
+    if (entry[field] === undefined) return fallback;
+    const normalized = normalizeLorebookEnum(entry[field]);
+    const matched = allowed.find(value => value === normalized);
+    if (matched !== undefined) return matched;
+    throw new WorldBookImportError(`${prefix}使用了不支持的 ${field}。可导入的值：${allowed.join("、")}（大小写均可）。`);
+}
+
+function reportUnknownFields(record: Record<string, unknown>, fields: Set<string>, scope: string, warnings: Set<string>): void {
+    const unknown = Object.keys(record).filter(field => !fields.has(field));
+    for (const field of unknown) warnings.add(`Float 未应用${scope}字段 ${field}。`);
+}
+
+function convertLorebookEntry(raw: unknown, index: number, bookDisabled: boolean, warnings: Set<string>): Record<string, unknown> {
+    const entry = worldBookRecord(raw);
+    const prefix = `Lorebook 第 ${index + 1} 条`;
+    if (!entry || typeof entry.content !== "string") throw new WorldBookImportError(`${prefix}的 content 必须是字符串。`);
+    if (entry.name !== undefined && typeof entry.name !== "string") throw new WorldBookImportError(`${prefix}的 name 必须是字符串。`);
+    const keywords = entry.keywords ?? [];
+    if (!Array.isArray(keywords) || !keywords.every(word => typeof word === "string")) {
+        throw new WorldBookImportError(`${prefix}的 keywords 必须是字符串数组。`);
+    }
+    for (const field of ["enabled", "constantActive", "useRegex", "caseSensitive"]) {
+        if (entry[field] !== undefined && typeof entry[field] !== "boolean") {
+            throw new WorldBookImportError(`${prefix}的 ${field} 必须是布尔值。`);
+        }
+    }
+    const priority = entry.priority ?? 0;
+    const depth = entry.injectDepth ?? 4;
+    if (typeof priority !== "number" || !Number.isSafeInteger(priority)) throw new WorldBookImportError(`${prefix}的 priority 必须是整数。`);
+    if (typeof depth !== "number" || !Number.isSafeInteger(depth) || depth < 0) throw new WorldBookImportError(`${prefix}的 injectDepth 必须是非负整数。`);
+
+    let position: number;
+    let mappedDepth = depth;
+    const sourcePosition = readLorebookEnum(entry, "position", "after_system_prompt", LOREBOOK_POSITIONS, prefix);
+    switch (sourcePosition) {
+        case "before_system_prompt": position = 0; break;
+        case "after_system_prompt":
+            position = 1;
+            warnings.add("AFTER_SYSTEM_PROMPT 近似映射为角色设定后。单聊与群聊成员独享书依赖当前预设的 worldInfoAfter 标记。");
+            break;
+        case "at_depth": position = 4; mappedDepth = Math.max(1, depth); break;
+        case "bottom_of_chat":
+            position = 4;
+            mappedDepth = 1;
+            warnings.add("BOTTOM_OF_CHAT 近似映射为深度 1，实际位置取决于 Float 的聊天历史。");
+            break;
+        case "top_of_chat":
+            position = 1;
+            warnings.add("Float 没有动态的聊天开头位置，top_of_chat 已映射到角色设定后。");
+            break;
+    }
+
+    const role = readLorebookEnum(entry, "role", "user", LOREBOOK_ROLES, prefix);
+    if (entry.caseSensitive === true) warnings.add("Float 的世界书匹配不区分大小写，未应用 caseSensitive。");
+    if (entry.scanDepth !== undefined) warnings.add("Float 使用自己的关键词扫描范围，未应用 Lorebook 条目的 scanDepth。");
+    for (const field of ["sticky", "cooldown", "delay"]) {
+        if (field in entry) warnings.add(`Float 未应用 Lorebook 的计时字段 ${field}。`);
+    }
+    if (keywords.some(word => word.includes(","))) warnings.add("Float 使用逗号分隔关键词，含逗号的关键词会按多个关键词匹配。");
+    reportUnknownFields(entry, LOREBOOK_ENTRY_FIELDS, "条目", warnings);
+
+    return {
+        id: entry.id, name: entry.name, content: entry.content, keywords,
+        enabled: !bookDisabled && entry.enabled !== false,
+        constantActive: entry.constantActive, use_regex: entry.useRegex,
+        position, depth: mappedDepth, role,
+        // RikkaHub sorts descending by priority; Float sorts ascending by insertion_order.
+        insertion_order: priority === 0 ? 0 : -priority,
+        orderSource: "lorebook",
+    };
+}
+
+function readWorldBookImport(text: string): { book: WorldBookConfig; warnings: string[] } {
+    let root: Record<string, unknown> | null;
+    try {
+        root = worldBookRecord(JSON.parse(text.replace(/^\uFEFF/, "")));
+    } catch {
+        throw new WorldBookImportError("JSON 语法错误，请检查文件是否完整。");
+    }
+    if (!root) throw new WorldBookImportError("世界书 JSON 的根节点必须是对象。");
+
+    const lorebook = normalizeLorebookEnum(root.type) === "lorebook";
+    let obj = root;
+    const warnings = new Set<string>();
+    if (lorebook) {
+        if (root.version !== 1) throw new WorldBookImportError("仅支持 version: 1 的 Lorebook。", true);
+        const data = worldBookRecord(root.data);
+        if (!data || !Array.isArray(data.entries)) throw new WorldBookImportError("Lorebook 缺少 data.entries 数组。");
+        if (typeof data.name !== "string") throw new WorldBookImportError("Lorebook 的 data.name 必须是字符串。");
+        if (data.enabled !== undefined && typeof data.enabled !== "boolean") throw new WorldBookImportError("Lorebook 的 data.enabled 必须是布尔值。");
+        obj = data;
+        reportUnknownFields(root, new Set(["version", "type", "data"]), "封装", warnings);
+        reportUnknownFields(data, LOREBOOK_FIELDS, "世界书", warnings);
+        if (data.enabled === false) warnings.add("原 Lorebook 整本已停用，导入的条目均设为停用。");
+    } else if (UNSUPPORTED_WB_ROOT_FIELDS.some(field => field in root)) {
+        throw new WorldBookImportError("该世界书包含 Float 不支持的整本匹配规则。", true);
+    }
+
+    const rawEntries = Array.isArray(obj.entries) ? obj.entries : worldBookRecord(obj.entries);
+    if (!rawEntries) throw new WorldBookImportError("世界书缺少有效的 entries 条目集合。");
+    const items = Object.entries(rawEntries);
+    if (!items.length) throw new WorldBookImportError("世界书没有条目，未导入。");
+
+    const entries: WorldBookEntry[] = [];
+    const ids = new Set<string>();
+    for (const [index, [key, raw]] of items.entries()) {
+        let entry: WorldBookEntry | null;
+        try {
+            const source = lorebook ? convertLorebookEntry(raw, index, obj.enabled === false, warnings) : raw;
+            entry = parseWorldBookEntry(source, { fallbackUid: Array.isArray(rawEntries) ? undefined : key });
+        } catch (error) {
+            if (error instanceof Error && error.message === UNSUPPORTED_IMPORT_FORMAT) {
+                throw new WorldBookImportError(`第 ${index + 1} 条含有 Float 不支持的匹配规则。`, true);
+            }
+            throw error;
+        }
+        if (!entry) throw new WorldBookImportError(`第 ${index + 1} 条格式不正确，请检查条目正文与字段。`);
+        if (ids.has(entry.uid)) throw new WorldBookImportError(`第 ${index + 1} 条的 ID 重复，未导入。`);
+        ids.add(entry.uid);
+        entries.push(entry);
+    }
+
+    const book = createWorldBook(typeof obj.name === "string" && obj.name.trim() ? obj.name : "导入的世界书");
+    return {
+        book: {
+            ...book,
+            id: worldBookId(obj.id) ?? book.id,
+            description: typeof obj.description === "string" ? obj.description : book.description,
+            createdAt: worldBookNumber(obj.createdAt, book.createdAt),
+            updatedAt: worldBookNumber(obj.updatedAt, book.updatedAt),
+            entries,
+        },
+        warnings: [...warnings],
     };
 }
 
 export function parseWorldBookFromJson(text: string): WorldBookConfig | null {
     try {
-        const obj = JSON.parse(text);
-        if (!obj || typeof obj !== "object") return null;
-
-        if (isUnsupportedWorldBookFormat(obj)) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
-
-        const wb = createWorldBook(obj.name || "导入的世界书");
-        if (Array.isArray(obj.entries)) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const parsedEntries = obj.entries.map((e: any) => parseWorldBookEntry(e));
-
-            // Note: some formats might use dictionary-shaped entries.
-            wb.entries = parsedEntries;
-        } else if (typeof obj.entries === "object" && obj.entries !== null) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const parsedEntries = Object.values(obj.entries).map((e: any) => parseWorldBookEntry(e));
-            wb.entries = parsedEntries;
-        }
-
-        return wb;
-    } catch (e) {
-        if (e instanceof Error && e.message === UNSUPPORTED_IMPORT_FORMAT) throw e;
+        return readWorldBookImport(text).book;
+    } catch (error) {
+        if (error instanceof WorldBookImportError && error.unsupported) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
         return null;
     }
+}
+
+export async function importWorldBookFromJson(text: string): Promise<{ book: WorldBookConfig; warnings: string[] }> {
+    const result = readWorldBookImport(text);
+    await hydrateSettingsDb();
+    // A failed legacy migration can still leave an existing book in the in-memory cache.
+    if (readWorldBooksCache().some(book => book.id === result.book.id)) {
+        throw new WorldBookImportError("已存在相同 ID 的世界书，原有内容与角色绑定已保留。");
+    }
+    try {
+        await insertWorldBook(result.book);
+    } catch (error) {
+        if (error && typeof error === "object" && "name" in error && error.name === "ConstraintError") {
+            throw new WorldBookImportError("已存在相同 ID 的世界书，原有内容与角色绑定已保留。");
+        }
+        throw new WorldBookImportError("无法写入浏览器的 IndexedDB，未导入世界书。请检查可用存储空间和浏览器权限。");
+    }
+    return result;
 }
 
 // --- Regexes ──────────────────────────────────────────
@@ -879,7 +1052,7 @@ function normalizeBindingConfig(config: BindingConfig): { config: BindingConfig;
     };
 }
 
-export function loadBindingConfig(): BindingConfig {
+export function loadBindingConfig({ persist = true }: { persist?: boolean } = {}): BindingConfig {
     if (typeof window === "undefined") return { ...DEFAULT_BINDING_CONFIG };
     try {
         const raw = kvGet(BINDINGS_KEY);
@@ -887,13 +1060,13 @@ export function loadBindingConfig(): BindingConfig {
             // Attempt migration from legacy overrides
             const migrated = migrateLegacyOverrides();
             if (migrated) {
-                saveBindingConfig(migrated, false);
+                if (persist) saveBindingConfig(migrated, false);
                 return migrated;
             }
             return { ...DEFAULT_BINDING_CONFIG };
         }
         const normalized = normalizeBindingConfig(JSON.parse(raw) as BindingConfig);
-        if (normalized.changed) saveBindingConfig(normalized.config, false);
+        if (persist && normalized.changed) saveBindingConfig(normalized.config, false);
         return normalized.config;
     } catch {
         return { ...DEFAULT_BINDING_CONFIG };

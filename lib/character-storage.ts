@@ -29,7 +29,7 @@ export function generateWechatID(): string {
   return prefix + suffix;
 }
 
-export function loadCharacters(): Character[] {
+export function loadCharacters({ persist = true }: { persist?: boolean } = {}): Character[] {
   if (_charsCache) return _charsCache;
   if (typeof window === "undefined") return [];
   try {
@@ -67,10 +67,10 @@ export function loadCharacters(): Character[] {
       return char as Character;
     });
 
-    if (needsSave) {
+    if (persist && needsSave) {
       setTimeout(() => saveCharacters(chars), 0);
     }
-    _charsCache = chars;
+    if (persist) _charsCache = chars;
     return chars;
   } catch {
     return [];

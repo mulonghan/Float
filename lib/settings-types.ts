@@ -21,6 +21,7 @@ export type WorldBookEntry = {
     useProbability?: boolean;
     role?: number;
     insertion_order: number;
+    orderSource?: "lorebook";
 };
 
 export type WorldBookConfig = SettingItemMeta & {
