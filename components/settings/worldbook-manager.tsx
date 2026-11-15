@@ -783,9 +783,10 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                                 </span>
                                                             </div>
                                                             <div className="flex flex-col gap-1">
-                                                                <label className="menu-desc">消息角色 (Role)</label>
+                                                                <label className="menu-desc" htmlFor={`wb-role-${entry.uid}`}>消息角色 (Role)</label>
                                                                 <select
-                                                                    value={entry.role ?? 0}
+                                                                    id={`wb-role-${entry.uid}`}
+                                                                    value={entry.position === 4 ? (entry.role ?? 0) : 0}
                                                                     onChange={(e) => updateEntry(entry.uid, { role: parseInt(e.target.value) || 0 })}
                                                                     disabled={entry.position !== 4}
                                                                     className="ui-select ts-13"
@@ -796,7 +797,7 @@ export function WorldBookManager({ isActive = true }: { isActive?: boolean } = {
                                                                 </select>
                                                             </div>
                                                             {entry.position !== 4 && (
-                                                                <p className="menu-desc col-span-full">在此位置以 System 注入。已保存的角色和深度将在切换到「按深度插入」后生效。</p>
+                                                                <p className="menu-desc col-span-full">实际注入身份：System（系统）。切换到「按深度插入」后，已保存的角色和深度会重新生效。</p>
                                                             )}
                                                             <div className="col-span-full flex items-center gap-3">
                                                                 <span className="menu-desc !mt-0 shrink-0">触发概率 (Probability)</span>
